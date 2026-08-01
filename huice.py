@@ -75,7 +75,7 @@ def handle_bar(context, bar_dict):
                 # 获取下一个交易日日期，并赋值。新DF行附加到context.df_celue
                 row_new['date'] = get_next_trading_date(context.now.strftime('%Y-%m-%d'), 1)
                 row_new = pd.DataFrame(row_new).T.set_index('date', drop=False)
-                context.df_celue = context.df_celue.append(row_new)
+                context.df_celue = pd.concat([context.df_celue, row_new])
                 continue
 
             # 获取当前投资组合中具体股票的数据
@@ -93,7 +93,7 @@ def handle_bar(context, bar_dict):
 
                     buy_price = context.df_celue.loc[(context.df_celue['code'] == row['code'])
                                                      & (context.df_celue['celue_buy'] == True)
-                                                     & (context.df_celue['date'] < context.now.strftime('%Y-%m-%d'))
+                                                     & (context.df_celue['date'] < pd.to_datetime(context.now.strftime('%Y-%m-%d')))
                                                      ].iloc[-1].close
                     sell_price = context.df_today.loc[(context.df_today['code'] == row['code'])].iloc[-1].close
                     series = pd.Series(data={"trading_datetime": context.now,
@@ -102,7 +102,7 @@ def handle_bar(context, bar_dict):
                                              "盈亏金额": cur_pnl,
                                              "盈亏率": round(sell_price/buy_price-1, 4),
                                              })
-                    context.stock_pnl = context.stock_pnl.append(series, ignore_index=True)
+                    context.stock_pnl = pd.concat([context.stock_pnl, series.to_frame().T], ignore_index=True)
                 else:
                     # 委托单未成交
                     logger.info(f"{row['code']} {get_next_trading_date(context.now.strftime('%Y-%m-%d'))} 补单")
@@ -110,7 +110,7 @@ def handle_bar(context, bar_dict):
                     # 获取下一个交易日日期，并赋值。新DF行附加到context.df_celue
                     row_new['date'] = get_next_trading_date(context.now.strftime('%Y-%m-%d'), 1)
                     row_new = pd.DataFrame(row_new).T.set_index('date', drop=False)
-                    context.df_celue = context.df_celue.append(row_new)
+                    context.df_celue = pd.concat([context.df_celue, row_new])
                     # 根据日期删除有隐患，可能删除当日所有记录。不删程序也不影响
                     # context.df_celue.drop(
                     #     context.df_celue.loc[(context.df_celue['date'] == row['date'])
@@ -151,7 +151,7 @@ def handle_bar(context, bar_dict):
                     # 获取下一个交易日日期，并赋值。新DF行附加到context.df_celue
                     row_new['date'] = get_next_trading_date(context.now.strftime('%Y-%m-%d'), 1)
                     row_new = pd.DataFrame(row_new).T.set_index('date', drop=False)
-                    context.df_celue = context.df_celue.append(row_new)
+                    context.df_celue = pd.concat([context.df_celue, row_new])
                 # 订单成功完成
                 else:
                     pass
@@ -240,11 +240,19 @@ result_dict = pd.read_pickle(rq_result_filename + ".pkl")
 
 # 给rq_result.pkl的交割单添加个股盈亏和收益率统计
 df_trades = result_dict['trades']
-df_temp = pd.read_csv('temp.csv', index_col=0, encoding='gbk').set_index('trading_datetime', drop=False)  # 个股卖出盈亏金额DF
-df_temp.index.name = 'datetime'  # 重置index的name
-df_temp = pd.merge(df_trades, df_temp, how='right')  # merge，以df_temp为准。相当于更新df_temp
-df_trades = pd.merge(df_trades, df_temp, how='left')  # merge，以df_trades为准。相当于更新df_trades
-result_dict['trades'] = df_trades
+try:
+    df_temp = pd.read_csv('temp.csv', index_col=0, encoding='gbk')
+    if 'trading_datetime' in df_temp.columns:
+        df_temp = df_temp.set_index('trading_datetime')
+    df_temp.index.name = 'datetime'
+    # 避免列名冲突，重命名列
+    df_temp = df_temp.rename(columns=lambda x: x + '_temp' if x in df_trades.columns else x)
+    df_trades = pd.merge(df_trades, df_temp, left_index=True, right_index=True, how='left')
+    result_dict['trades'] = df_trades
+except FileNotFoundError:
+    print("temp.csv 不存在，跳过合并")
+except Exception as e:
+    print(f"合并交割单数据出错: {e}")
 with open(rq_result_filename+".pkl", 'wb') as fobj:
     pickle.dump(result_dict, fobj)
 os.remove('temp.csv') if os.path.exists("temp.csv") else None
