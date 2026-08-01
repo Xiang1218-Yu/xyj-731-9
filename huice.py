@@ -179,7 +179,7 @@ __config__ = {
         "start_date": start_date,
         "end_date": end_date,
         # 数据源所存储的文件路径
-        "data_bundle_path": "C:/Users/king/.rqalpha/bundle/",
+        "data_bundle_path": os.path.expanduser("~/.rqalpha/bundle"),
         "strategy_file": "huice.py",
         # 目前支持 `1d` (日线回测) 和 `1m` (分钟线回测)，如果要进行分钟线，请注意是否拥有对应的数据源，目前开源版本是不提供对应的数据源的。
         "frequency": "1d",

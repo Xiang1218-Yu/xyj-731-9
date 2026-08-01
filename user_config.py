@@ -10,13 +10,14 @@
 debug = False  # 是否开启调试日志输出  开=True  关=False
 
 # 目录最好事先手动建立好，不然程序会出错
+# 修改为当前项目目录下的相对路径，适配macOS
 tdx = {
-    'tdx_path': 'd:/stock/通达信',  # 指定通达信目录
-    'csv_lday': 'd:/TDXdata/lday_qfq',  # 指定csv格式日线数据保存目录
-    'pickle': 'd:/TDXdata/pickle',  # 指定pickle格式日线数据保存目录
-    'csv_index': 'd:/TDXdata/index',  # 指定指数保存目录
-    'csv_cw': 'd:/TDXdata/cw',  # 指定专业财务保存目录
-    'csv_gbbq': 'd:/TDXdata',  # 指定股本变迁保存目录
+    'tdx_path': '/Users/tog/Desktop/code/gsb/gsb-731/xyj-731-9/xyj-731-9/data/tdx',  # 指定通达信目录
+    'csv_lday': '/Users/tog/Desktop/code/gsb/gsb-731/xyj-731-9/xyj-731-9/data/lday_qfq',  # 指定csv格式日线数据保存目录
+    'pickle': '/Users/tog/Desktop/code/gsb/gsb-731/xyj-731-9/xyj-731-9/data/pickle',  # 指定pickle格式日线数据保存目录
+    'csv_index': '/Users/tog/Desktop/code/gsb/gsb-731/xyj-731-9/xyj-731-9/data/index',  # 指定指数保存目录
+    'csv_cw': '/Users/tog/Desktop/code/gsb/gsb-731/xyj-731-9/xyj-731-9/data/cw',  # 指定专业财务保存目录
+    'csv_gbbq': '/Users/tog/Desktop/code/gsb/gsb-731/xyj-731-9/xyj-731-9/data',  # 指定股本变迁保存目录
     'pytdx_ip': '218.6.170.55',  # 指定pytdx的通达信服务器IP
     'pytdx_port': 7709,  # 指定pytdx的通达信服务器端口。int类型
 }

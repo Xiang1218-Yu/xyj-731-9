@@ -135,7 +135,7 @@ def marklinedata(df_stock):
                                       },
                                 name=index,
                                 )
-        TJ04_高低点 = TJ04_高低点.append(df_temp)
+        TJ04_高低点 = pd.concat([TJ04_高低点, df_temp.to_frame().T])
     TJ04_高低点.reset_index(drop=True, inplace=True)
 
     # 转换为pyecharts所需数据格式

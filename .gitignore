@@ -4,6 +4,8 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 venv
+data
+plot.html
 
 # 编辑器和IDE
 .vscode/

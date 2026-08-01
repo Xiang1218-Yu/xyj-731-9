@@ -128,7 +128,7 @@ def BARSLAST(series):
     #  BARSLAST(CLOSE/REF(CLOSE,1)>=1.1)表示上一个涨停板到当前的周期数
     result = pd.Series(index=series.index, dtype=int)
     i = 0
-    for k, v in series.iteritems():
+    for k, v in series.items():
         if v:
             i = 0
             result[k] = i
@@ -146,7 +146,7 @@ def BARSLASTCOUNT(cond):
     #  BARSLASTCOUNT(CLOSE>OPEN)表示统计连续收阳的周期数
     result = pd.Series(index=cond.index, dtype=int)
     i = 0
-    for k, v in cond.iteritems():
+    for k, v in cond.items():
         if v:
             i = i + 1
             result[k] = i

@@ -77,7 +77,7 @@ def celue_save(file_list, HS300_信号, tqdm_position=None):
                             * (len(file_list) - (file_list.index(stockcode) + 1)))
 
         # 提取celue是true的列，单独保存到一个df，返回这个df
-        df_celue = df_celue.append(df.loc[df['celue_buy'] | df['celue_sell']])
+        df_celue = pd.concat([df_celue, df.loc[df['celue_buy'] | df['celue_sell']]])
         # print(f'{process_info} 已用{(time.time() - starttime_tick):.2f}秒 剩余预计{lefttime_tick}秒')
     df_celue['date'] = pd.to_datetime(df_celue['date'], format='%Y-%m-%d')  # 转为时间格式
     df_celue.set_index('date', drop=False, inplace=True)  # 时间为索引。方便与另外复权的DF表对齐合并
@@ -154,8 +154,10 @@ if __name__ == '__main__':
         # 处理celue汇总.csv文件。保存为csv文件，方便查看
         df_celue = pd.DataFrame()
         # 读取pool的返回对象列表。i.get()是读取方法。拼接每个子进程返回的df
+        df_list = []
         for i in pool_result:
-            df_celue = df_celue.append(i.get())
+            df_list.append(i.get())
+        df_celue = pd.concat(df_list)
 
     # df_celue 是处理后的所有股票策略信号汇总文件。
     # 下面处理自定义股票板块剔除
@@ -164,19 +166,27 @@ if __name__ == '__main__':
     print(f'生成股票列表, 共 {len(stocklist)} 只股票')
     print(f'剔除通达信概念股票: {要剔除的通达信概念}')
     kicklist = []
-    df = func.get_TDX_blockfilecontent("block_gn.dat")
-    # 获取df中blockname列的值是ST板块的行，对应code列的值，转换为list。用filter函数与stocklist过滤，得出不包括ST股票的对象，最后转为list
-    for i in 要剔除的通达信概念:
-        kicklist = kicklist + df.loc[df['blockname'] == i]['code'].tolist()
+    try:
+        df = func.get_TDX_blockfilecontent("block_gn.dat")
+        for i in 要剔除的通达信概念:
+            kicklist = kicklist + df.loc[df['blockname'] == i]['code'].tolist()
+    except FileNotFoundError:
+        print("  通达信板块文件不存在，跳过概念剔除")
     print(f'剔除通达信行业股票: {要剔除的通达信行业}')
-    df = pd.read_csv(ucfg.tdx['tdx_path'] + os.sep + 'T0002' + os.sep + 'hq_cache' + os.sep + "tdxhy.cfg",
-                     sep='|', header=None, dtype='object')
-    for i in 要剔除的通达信行业:
-        kicklist = kicklist + df.loc[df[2] == i][1].tolist()
+    try:
+        df = pd.read_csv(ucfg.tdx['tdx_path'] + os.sep + 'T0002' + os.sep + 'hq_cache' + os.sep + "tdxhy.cfg",
+                         sep='|', header=None, dtype='object')
+        for i in 要剔除的通达信行业:
+            kicklist = kicklist + df.loc[df[2] == i][1].tolist()
+    except FileNotFoundError:
+        print("  通达信行业文件不存在，跳过行业剔除")
     print("剔除科创板股票")
-    tdx_stocks = pd.read_csv(ucfg.tdx['tdx_path'] + '/T0002/hq_cache/infoharbor_ex.code',
-                             sep='|', header=None, index_col=None, encoding='gbk', dtype={0: str})
-    kicklist = kicklist + tdx_stocks[0][tdx_stocks[0].apply(lambda x: x[0:2] == "68")].to_list()
+    try:
+        tdx_stocks = pd.read_csv(ucfg.tdx['tdx_path'] + '/T0002/hq_cache/infoharbor_ex.code',
+                                 sep='|', header=None, index_col=None, encoding='gbk', dtype={0: str})
+        kicklist = kicklist + tdx_stocks[0][tdx_stocks[0].apply(lambda x: x[0:2] == "68")].to_list()
+    except FileNotFoundError:
+        print("  通达信股票列表文件不存在，跳过科创板剔除")
     stocklist = list(filter(lambda i: i not in kicklist, stocklist))
     print(f'共 {len(stocklist)} 只候选股票')
     # df_celue 剔除在kicklist中的股票
