@@ -125,7 +125,8 @@ class _LogicParser:
         return tok
 
     def parse(self, values):
-        """values: dict 因子名->bool。返回表达式求值结果"""
+        """values: dict 因子名->bool。返回表达式求值结果。解析器可复用，每次从头解析"""
+        self.pos = 0
         if not self.tokens:
             raise ValueError('逻辑表达式为空')
         result = self._or_expr(values)
@@ -226,13 +227,22 @@ class MultiFactorEngine:
             raise ValueError('多因子配置中没有可用的因子，请检查 user_config.multi_factor')
         self.logic = str(config.get('logic', 'AND')).strip()
         self.score_threshold = float(config.get('score_threshold', 0.0))
-        # logic 为简单关键字时转为表达式，统一走解析器；单因子时logic不生效
+        # logic 为简单关键字时转为表达式，统一走解析器。
+        # not=True 的因子在自动生成的表达式中带 NOT 前缀，语义=“该因子不命中”
         if self.logic.upper() == 'AND':
-            self._expression = ' AND '.join(f['name'] for f in self.factors)
+            self._expression = ' AND '.join(
+                ('NOT ' if f.get('not', False) else '') + f['name'] for f in self.factors)
         elif self.logic.upper() == 'OR':
-            self._expression = ' OR '.join(f['name'] for f in self.factors)
+            self._expression = ' OR '.join(
+                ('NOT ' if f.get('not', False) else '') + f['name'] for f in self.factors)
         else:
+            # 自定义表达式：表达式是逻辑组合的唯一取反入口（一律在因子原始命中值上求值），
+            # 配置级 not 只影响评分口径与展示，不参与表达式求值，避免双重取反冲突
             self._expression = self.logic
+            for f in self.factors:
+                if f.get('not', False):
+                    print(f"[yellow]提示: 因子 [{f['name']}] 配置级 not=True 仅用于评分口径，"
+                          f"逻辑组合以表达式为准（如需取反请在表达式内写 NOT）[/yellow]")
 
     def factor_series(self, name, df, context):
         """计算指定因子的完整布尔序列（供监控/回测模块获取买卖信号序列使用）"""
@@ -253,52 +263,76 @@ class MultiFactorEngine:
         series = series.reindex(index).fillna(False)
         return series.astype(bool)
 
+    def evaluate_series(self, code, df, context=None, lookback=1):
+        """
+        对单只股票逐周期(bar)执行多因子组合评估，供监控模块对最近若干周期持续检测信号
+        :param code: 股票代码
+        :param df: 个股日线DF（时间为索引）
+        :param context: 策略上下文，含HS300_信号/start_date/end_date等
+        :param lookback: 只评估最后N个周期；None=评估全部周期
+        :return: DataFrame，索引为周期日期，列含 passed/score/logic_result/matched_strategies/detail
+        """
+        if context is None:
+            context = {}
+        # 各因子的完整布尔序列
+        factor_series = {}
+        for f in self.factors:
+            name = f['name']
+            try:
+                factor_series[name] = self.factor_series(name, df, context)
+            except Exception as e:
+                print(f'[yellow]{code} 因子[{name}]计算异常: {e}[/yellow]')
+                factor_series[name] = pd.Series(False, index=df.index)
+        weight_map = {f['name']: float(f.get('weight', 1.0)) for f in self.factors}
+        negate_map = {f['name']: bool(f.get('not', False)) for f in self.factors}
+        weight_sum = sum(weight_map.values())
+        parser = _LogicParser(self._expression)  # 解析器复用，parse内部会重置pos
+        bars = df.index if lookback is None else df.index[-lookback:]
+
+        rows = []
+        for bar in bars:
+            raw = {name: bool(series.get(bar, False)) for name, series in factor_series.items()}
+            # 逻辑组合：表达式在因子原始命中值上求值，NOT只能在表达式内书写
+            logic_result = parser.parse(raw)
+            # 综合评分：配置级not取反后的有效命中权重和 / 总权重
+            score_sum = 0.0
+            matched = []
+            for name, hit in raw.items():
+                effective = (not hit) if negate_map[name] else hit
+                if effective:
+                    score_sum += weight_map[name]
+                    matched.append(('NOT ' if negate_map[name] else '') + name)
+            score = (score_sum / weight_sum) if weight_sum > 0 else 0.0
+            rows.append({'date': bar,
+                         'passed': logic_result and score >= self.score_threshold,  # 逻辑通过且评分过门槛
+                         'score': score,
+                         'logic_result': logic_result,
+                         'matched_strategies': '|'.join(matched),
+                         'detail': raw})
+        df_result = pd.DataFrame(rows)
+        if len(df_result) == 0:
+            return pd.DataFrame(columns=['date', 'passed', 'score', 'logic_result',
+                                         'matched_strategies', 'detail'])
+        return df_result.set_index('date', drop=False)
+
     def evaluate_stock(self, code, df, context=None):
         """
-        对单只股票执行多因子组合评估
+        对单只股票执行多因子组合评估（评估最后一个周期）
         :param code: 股票代码
         :param df: 个股日线DF（时间为索引）
         :param context: 策略上下文，含HS300_信号/start_date/end_date等
         :return: EngineResult 含匹配的子策略列表和综合评分
         """
-        if context is None:
-            context = {}
+        df_result = self.evaluate_series(code, df, context, lookback=1)
         result = EngineResult(code)
-        raw_values = {}  # 因子原始命中值（最后一个周期）
-        eff_values = {}  # NOT取反后的有效命中值
-        score_sum = 0.0
-        weight_sum = 0.0
-
-        for f in self.factors:
-            name = f['name']
-            weight = float(f.get('weight', 1.0))
-            negate = bool(f.get('not', False))
-            try:
-                series = self.factor_series(name, df, context)
-                matched = bool(series.iloc[-1]) if len(series) > 0 else False
-            except Exception as e:
-                print(f'[yellow]{code} 因子[{name}]计算异常: {e}[/yellow]')
-                matched = False
-            effective = (not matched) if negate else matched
-            raw_values[name] = matched
-            eff_values[name] = effective
-            result.detail[name] = matched
-            if effective:
-                result.matched_strategies.append(('NOT ' if negate else '') + name)
-                score_sum += weight
-            weight_sum += weight
-
-        # 综合评分：有效命中因子的权重和 / 总权重
-        result.score = (score_sum / weight_sum) if weight_sum > 0 else 0.0
-        # 逻辑组合判定（表达式中因子名引用原始命中值，NOT在表达式内书写）
-        values = dict(raw_values)
-        # 配置级 not=True 的因子在表达式求值时按取反后参与，与评分口径一致
-        for f in self.factors:
-            if f.get('not', False) and f['name'] in values:
-                values[f['name']] = not values[f['name']]
-        result.logic_result = _LogicParser(self._expression).parse(values)
-        # 最终入选：逻辑组合通过 且 综合评分达到门槛
-        result.passed = result.logic_result and (result.score >= self.score_threshold)
+        if len(df_result) == 0:
+            return result
+        last = df_result.iloc[-1]
+        result.passed = bool(last['passed'])
+        result.score = float(last['score'])
+        result.logic_result = bool(last['logic_result'])
+        result.matched_strategies = last['matched_strategies'].split('|') if last['matched_strategies'] else []
+        result.detail = dict(last['detail'])
         return result
 
     def evaluate_stocklist(self, stocklist, df_loader, context=None):

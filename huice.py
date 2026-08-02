@@ -340,6 +340,29 @@ def print_analysis(metrics):
            f"\t平均盈利 {metrics['平均盈利']:>.2%}\t平均亏损 {metrics['平均亏损']:>.2%}")
 
 
+def save_analysis(metrics, result_name):
+    """
+    持久化回测结果分析：
+    1. 与回测pkl/png同目录的 <回测文件名>_analysis.txt 文本报告
+    2. 追加一行到 rq_result/analysis汇总.csv，便于多次回测横向对比
+    :param metrics: analyze_result返回的指标dict
+    :param result_name: 回测结果文件路径前缀（rq_result_filename，不含扩展名）
+    """
+    # 1. 文本报告
+    txt_path = result_name + '_analysis.txt'
+    with open(txt_path, 'w', encoding='utf-8') as f:
+        f.write(f'回测结果分析 {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}\n')
+        for k, v in metrics.items():
+            f.write(f'{k}: {v:.4f}\n' if isinstance(v, float) else f'{k}: {v}\n')
+    # 2. 汇总CSV。首列为回测文件名，后续列为各指标
+    csv_path = os.path.join('rq_result', 'analysis汇总.csv')
+    row = pd.DataFrame([metrics])
+    row.insert(0, '回测文件', os.path.basename(result_name))
+    row.to_csv(csv_path, mode='a', index=False,
+               header=not os.path.exists(csv_path), encoding='gbk')
+    rprint(f'分析结果已持久化: {txt_path} 及 {csv_path}')
+
+
 start_time = f'程序开始时间：{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}'
 
 if __name__ == '__main__':
@@ -405,5 +428,7 @@ if __name__ == '__main__':
         f"\t基准收益 {result_dict['summary']['benchmark_total_returns']:>.2%}\t基准年化 {result_dict['summary']['benchmark_annualized_returns']:>.2%}"
         f"\t最大回撤 {result_dict['summary']['max_drawdown']:>.2%}"
         f"\n打开程序文件夹下的rq_result.png查看收益走势图")
-    # 回测结果分析：输出夏普比率、最大回撤、胜率等统计指标
-    print_analysis(analyze_result(result_dict))
+    # 回测流程结束后自动执行结果分析：输出夏普比率、最大回撤、胜率等统计指标，并持久化到文件
+    metrics = analyze_result(result_dict)
+    print_analysis(metrics)
+    save_analysis(metrics, rq_result_filename)
