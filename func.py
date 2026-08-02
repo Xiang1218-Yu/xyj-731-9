@@ -557,7 +557,7 @@ def make_fq(code, df_code, df_gbbq, df_cw='', start_date='', end_date='', fqtype
     # print(data)
 
     data['if_trade'].fillna(value=False, inplace=True)  # if_trade列，无效的值填充为False
-    data.fillna(method='ffill', inplace=True)  # 向下填充无效值
+    data.ffill(inplace=True)  # 向下填充无效值
 
     # 提取info表的'fenhong', 'peigu', 'peigujia',‘songzhuangu'列的值，按日期一一对应，列拼接到data表。
     # 也就是将当日是除权除息日的行，对应的除权除息数据，写入对应的data表的行。
@@ -609,15 +609,15 @@ def make_fq(code, df_code, df_gbbq, df_cw='', start_date='', end_date='', fqtype
     # df_ltg拼接回原DF
     data = pd.concat([data, df_ltg], axis=1)
 
-    data = data.fillna(method='ffill')  # 向下填充无效值
-    data = data.fillna(method='bfill')  # 向上填充无效值  为了弥补开始几行的空值
+    data = data.ffill()  # 向下填充无效值
+    data = data.bfill()  # 向上填充无效值  为了弥补开始几行的空值
     data = data.round({'open': 2, 'high': 2, 'low': 2, 'close': 2, })  # 指定列四舍五入
     if '流通股' in data.columns.to_list():
         data['流通市值'] = data['流通股'] * data['close']
         data['换手率'] = data['vol'] / data['流通股'] * 100
         data = data.round({'流通市值': 2, '换手率': 2, })  # 指定列四舍五入
     if flag_attach:  # 追加模式，则附加最新处理的数据
-        data = df_code_original.append(data)
+        data = pd.concat([df_code_original, data])
 
     if len(start_date) == 0 and len(end_date) == 0:
         pass
@@ -755,9 +755,9 @@ def update_stockquote(code, df_history, df_today):
             df_today['date'] = now_date
         df_today.set_index('date', drop=False, inplace=True)
         df_today = df_today.rename(columns={'price': 'close'})
-        df_today = df_today[{'code', 'date', 'open', 'high', 'low', 'close', 'vol', 'amount'}]
+        df_today = df_today[['code', 'date', 'open', 'high', 'low', 'close', 'vol', 'amount']]
         result = pd.concat([df_history, df_today], axis=0, ignore_index=False)
-        result = result.fillna(method='ffill')  # 向下填充无效值
+        result = result.ffill()  # 向下填充无效值
         if '流通市值' and '换手率' in result.columns.tolist():
             result['流通市值'] = result['流通股'] * result['close']
             result = result.round({'流通市值': 2, })  # 指定列四舍五入

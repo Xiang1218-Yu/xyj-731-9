@@ -123,11 +123,11 @@ def 策略2(df, HS300_信号, start_date='', end_date=''):
             TJ06_MA60.iloc[i] = MA60.iloc[i - int(v)]
 
     df = pd.concat([df, TJ06_MA60_DAY.rename('TJ06_MA60_DAY')], axis=1)
-    df.insert(df.shape[1], 'TJ06_MA60_LLV', np.NaN)
+    df.insert(df.shape[1], 'TJ06_MA60_LLV', np.nan)
     for index_date in df.loc[df['TJ06_MA60_DAY'] == 0].index.to_list():
         index_int = df.index.get_loc(index_date)
         df.at[index_date, 'TJ06_MA60_LLV'] = df.iloc[index_int - 20:index_int]['close'].min()
-    df = df.fillna(method='ffill')
+    df = df.ffill()  # 向下填充无效值
     TJ06_MA60_LLV = df['TJ06_MA60_LLV']
 
     TJ06_3 = TJ06_MA60 / TJ06_MA60_LLV
@@ -177,8 +177,8 @@ def 卖策略(df, 策略2, start_date='', end_date=''):
     for i in BUY_TODAY[BUY_TODAY == 0].index.to_list()[::-1]:
         BUY_PRICE_CLOSE.loc[i] = C.loc[i]
         BUY_PRICE_OPEN.loc[i] = O.loc[i]
-        BUY_PRICE_CLOSE.fillna(method='ffill', inplace=True)
-        BUY_PRICE_OPEN.fillna(method='ffill', inplace=True)
+        BUY_PRICE_CLOSE.ffill(inplace=True)  # 向下填充无效值
+        BUY_PRICE_OPEN.ffill(inplace=True)  # 向下填充无效值
         BUY_PCT = C / BUY_PRICE_CLOSE - 1
         for k, v in BUY_PCT[i:].items():
             if np.isnan(BUY_PCT_MAX[k]):

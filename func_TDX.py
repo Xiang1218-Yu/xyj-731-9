@@ -64,7 +64,7 @@ def HHV(series, day):
             if tmp < series.iat[i]:
                 tmp = series.iat[i]
                 value.iat[i] = tmp
-        value = value.fillna(method='ffill')  # 向下填充无效值
+        value = value.ffill()  # 向下填充无效值
     else:
         value = series.rolling(day).max()
         value.iloc[0:day-1] = HHV(series.iloc[0:day-1], 0)
@@ -84,7 +84,7 @@ def LLV(series, day):
             if tmp > series.iat[i]:
                 tmp = series.iat[i]
                 value.iat[i] = tmp
-        value = value.fillna(method='ffill')  # 向下填充无效值
+        value = value.ffill()  # 向下填充无效值
     else:
         value = series.rolling(day).min()
         value.iloc[0:day - 1] = LLV(series.iloc[0:day - 1], 0)
@@ -159,5 +159,5 @@ def BARSLASTCOUNT(cond):
 def VALUEWHEN(cond, value_series):
     result = pd.Series(index=cond.index, dtype=float)
     result.loc[cond.loc[cond==True].keys()] = value_series.loc[cond.loc[cond==True].keys()]
-    result = result.fillna(method='ffill')  # 向下填充无效值
+    result = result.ffill()  # 向下填充无效值
     return result
