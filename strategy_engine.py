@@ -106,9 +106,10 @@ class StrategyNode:
 class _LogicNode:
     """逻辑组合节点基类"""
 
-    def __init__(self, children, name=None):
+    def __init__(self, children, name=None, weight=1.0):
         self.children = children
         self.name = name or self.__class__.__name__
+        self.weight = float(weight)
 
     def evaluate(self, df, **context):
         raise NotImplementedError
@@ -118,21 +119,36 @@ class AND(_LogicNode):
     """所有子策略都命中才命中"""
 
     def evaluate(self, df, **context):
-        all_matched = []
-        all_strategies = []
+        child_results = []
+        all_matched = True
         total_score = 0.0
         details = {}
         for child in self.children:
             r = child.evaluate(df, **context)
-            all_matched.append(r.matched)
-            all_strategies.extend(r.matched_strategies)
+            child_results.append(r)
+            if not r.matched:
+                all_matched = False
             total_score += r.score
             details.update(r.details)
-        matched = all(all_matched) if len(all_matched) > 0 else False
+
+        if all_matched:
+            # 全部命中：收集所有子策略名称
+            matched_strategies = []
+            for r in child_results:
+                matched_strategies.extend(r.matched_strategies)
+            score = total_score
+        else:
+            # 未全部命中：只收集已命中子节点的策略名称（部分匹配信息）
+            matched_strategies = []
+            for r in child_results:
+                if r.matched:
+                    matched_strategies.extend(r.matched_strategies)
+            score = total_score * 0.5  # 部分匹配给半权
+
         return StrategyResult(
-            matched=matched,
-            matched_strategies=all_strategies if matched else [s for s, m in zip(all_strategies, all_matched) if m],
-            score=total_score if matched else total_score * 0.5,
+            matched=all_matched,
+            matched_strategies=matched_strategies,
+            score=score,
             details=details,
         )
 
@@ -150,7 +166,7 @@ class OR(_LogicNode):
             if r.matched:
                 any_matched = True
                 matched_strategies.extend(r.matched_strategies)
-            total_score = max(total_score, r.score)
+                total_score = max(total_score, r.score)
             details.update(r.details)
         return StrategyResult(
             matched=any_matched,
@@ -161,19 +177,30 @@ class OR(_LogicNode):
 
 
 class NOT(_LogicNode):
-    """对单个子策略结果取反"""
+    """
+    对单个子策略结果取反。
+    :param weight: NOT 命中时（子策略未命中）的评分权重
+    """
 
-    def __init__(self, child, name=None):
-        super().__init__([child], name=name or "NOT")
+    def __init__(self, child, name=None, weight=1.0):
+        super().__init__([child], name=name or "NOT", weight=weight)
 
     def evaluate(self, df, **context):
         child = self.children[0]
         r = child.evaluate(df, **context)
         matched = not r.matched
+        if matched:
+            # 子策略未命中，NOT 命中，给 NOT 自身权重分
+            matched_strategies = [f"NOT({s})" for s in r.matched_strategies] if r.matched_strategies else [self.name]
+            score = self.weight
+        else:
+            # 子策略命中，NOT 未命中
+            matched_strategies = []
+            score = 0.0
         return StrategyResult(
             matched=matched,
-            matched_strategies=[f"NOT({s})" for s in r.matched_strategies] if matched else [],
-            score=child.weight if hasattr(child, 'weight') and matched else (0.0 if matched else 1.0),
+            matched_strategies=matched_strategies,
+            score=score,
             details={f"NOT({k})": not v for k, v in r.details.items()},
         )
 
@@ -301,14 +328,16 @@ def build_engine_from_config(config):
         if 'logic' in node_cfg:
             logic = node_cfg['logic'].upper()
             children = [_build_node(c) for c in node_cfg.get('strategies', [])]
+            weight = node_cfg.get('weight', 1.0)
+            node_name = node_cfg.get('name')
             if logic == 'AND':
-                return AND(children, name=node_cfg.get('name'))
+                return AND(children, name=node_name, weight=weight)
             elif logic == 'OR':
-                return OR(children, name=node_cfg.get('name'))
+                return OR(children, name=node_name, weight=weight)
             elif logic == 'NOT':
                 if len(children) != 1:
                     raise ValueError("NOT 逻辑节点必须恰好包含一个子策略")
-                return NOT(children[0], name=node_cfg.get('name'))
+                return NOT(children[0], name=node_name, weight=weight)
             else:
                 raise ValueError(f"不支持的逻辑类型: {logic}")
         else:

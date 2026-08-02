@@ -129,14 +129,32 @@ def run_celue2(stocklist, HS300_信号, df_gbbq, df_today, tqdm_position=None):
     return stocklist
 
 
-def run_multi_factor_worker(stocklist, engine_config, HS300_信号, df_gbbq, df_today,
+# 多进程 worker 的全局引擎变量，通过 initializer 在每个子进程启动时构建一次，避免重复构建
+_worker_engine = None
+_worker_engine_config = None
+
+
+def _init_worker(engine_config, lock):
+    """进程池初始化函数：在每个子进程启动时构建一次策略引擎并复用"""
+    global _worker_engine, _worker_engine_config
+    tqdm.set_lock(lock)
+    _worker_engine_config = engine_config
+    if engine_config is not None:
+        _worker_engine = strategy_engine.build_engine_from_config(engine_config)
+
+
+def run_multi_factor_worker(stocklist, HS300_信号, df_gbbq, df_today,
                             start_date='', end_date='', tqdm_position=None):
     """
     多因子策略引擎工作函数，可在多进程中调用。
+    引擎实例由 _init_worker 在进程启动时构建一次，通过全局变量复用，避免每只股票重复构建。
     返回 {stockcode: StrategyResult} 字典。
     """
-    # 每个子进程内部构建自己的引擎实例，避免 pickle 问题
-    engine = strategy_engine.build_engine_from_config(engine_config)
+    global _worker_engine
+    if _worker_engine is None:
+        # 单进程模式下 initializer 未执行，在此兜底构建
+        _worker_engine = strategy_engine.build_engine_from_config(_worker_engine_config)
+
     results = {}
     tq = tqdm(stocklist[:], leave=False, position=tqdm_position)
     for stockcode in tq:
@@ -158,7 +176,7 @@ def run_multi_factor_worker(stocklist, engine_config, HS300_信号, df_gbbq, df_
             context['HS300_信号'] = HS300_信号
         if df_gbbq is not None:
             context['df_gbbq'] = df_gbbq
-        result = engine.evaluate(df_stock, **context)
+        result = _worker_engine.evaluate(df_stock, **context)
         if result.matched:
             results[stockcode] = result
     return results
@@ -252,19 +270,23 @@ if __name__ == '__main__':
         multi_results = {}
 
         if 'single' in sys.argv[1:]:
+            # 单进程模式：设置全局配置后直接调用，worker 内部兜底构建一次引擎
+            _worker_engine_config = engine_config
             multi_results = run_multi_factor_worker(
-                stocklist, engine_config, HS300_信号, df_gbbq, df_today,
+                stocklist, HS300_信号, df_gbbq, df_today,
                 start_date=start_date, end_date=end_date,
             )
         else:
-            # 多进程并行执行
+            # 多进程并行执行：通过 initializer 在每个子进程启动时构建一次引擎并复用
             if os.cpu_count() > 8:
                 t_num = int(os.cpu_count() / 1.5)
             else:
                 t_num = os.cpu_count() - 2
             freeze_support()
             tqdm.set_lock(RLock())
-            p = Pool(processes=t_num, initializer=tqdm.set_lock, initargs=(tqdm.get_lock(),))
+            # initializer 在每个子进程启动时执行一次，构建引擎实例并设置 tqdm 锁
+            p = Pool(processes=t_num, initializer=_init_worker,
+                    initargs=(engine_config, tqdm.get_lock()))
             pool_result = []
             for i in range(0, t_num):
                 div = int(len(stocklist) / t_num)
@@ -272,12 +294,12 @@ if __name__ == '__main__':
                 if i + 1 != t_num:
                     pool_result.append(p.apply_async(
                         run_multi_factor_worker,
-                        args=(stocklist[i * div:(i + 1) * div], engine_config,
+                        args=(stocklist[i * div:(i + 1) * div],
                               HS300_信号, df_gbbq, df_today, start_date, end_date, i)))
                 else:
                     pool_result.append(p.apply_async(
                         run_multi_factor_worker,
-                        args=(stocklist[i * div:(i + 1) * div + mod], engine_config,
+                        args=(stocklist[i * div:(i + 1) * div + mod],
                               HS300_信号, df_gbbq, df_today, start_date, end_date, i)))
             p.close()
             p.join()

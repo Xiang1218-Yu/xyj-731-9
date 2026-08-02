@@ -11,7 +11,15 @@
   python monitor.py                  # 使用全部候选股票监控
   python monitor.py 000001 600030    # 只监控指定股票
   python monitor.py --interval 60    # 指定轮询间隔（秒），默认30
-  python monitor.py --multi config.json  # 使用多因子策略引擎配置
+  python monitor.py --multi config.json       # 使用多因子策略引擎配置
+  python monitor.py --sell-buy-func 策略2     # 指定卖出策略依赖的买入信号函数
+  python monitor.py --sell-func 卖策略        # 指定卖出信号函数
+
+多因子配置中可通过 sell_config 指定卖出策略：
+  {
+    "logic": "AND", "strategies": [...],
+    "sell_config": {"buy_signal_func": "策略2", "sell_func": "卖策略"}
+  }
 
 编程用法：
   from monitor import StockMonitor
@@ -78,11 +86,25 @@ class StockMonitor:
     STATUS_RUNNING = 'running'
     STATUS_PAUSED = 'paused'
 
-    def __init__(self, stocklist=None, interval=30, engine_config=None, use_hs300_filter=True):
+    def __init__(self, stocklist=None, interval=30, engine_config=None, use_hs300_filter=True,
+                 sell_buy_func='策略2', sell_func='卖策略'):
+        """
+        :param sell_buy_func: str 卖出策略所依赖的买入信号函数名（CeLue.py 中的函数名），
+                                    多因子模式下应与引擎中的主买入策略一致，默认'策略2'
+        :param sell_func: str 卖出信号函数名，默认'卖策略'
+        """
         self.interval = interval
         self.engine_config = engine_config
         self.use_hs300_filter = use_hs300_filter
+        self.sell_buy_func_name = sell_buy_func
+        self.sell_func_name = sell_func
         self.logger = setup_logger()
+
+        # 从 engine_config 中提取 sell_config 覆盖默认值
+        if engine_config and 'sell_config' in engine_config:
+            sc = engine_config['sell_config']
+            self.sell_buy_func_name = sc.get('buy_signal_func', self.sell_buy_func_name)
+            self.sell_func_name = sc.get('sell_func', self.sell_func_name)
 
         # 运行状态控制
         self._status = self.STATUS_STOPPED
@@ -107,6 +129,8 @@ class StockMonitor:
 
         # 多因子引擎（在工作线程中构建，避免 pickle 问题）
         self._engine = None
+        self._sell_buy_func = None
+        self._sell_func = None
 
         # HS300 信号
         self._hs300_signal = None
@@ -121,11 +145,16 @@ class StockMonitor:
             return [i[:-4] for i in os.listdir(ucfg.tdx['pickle']) if i.endswith('.pkl')]
 
     def _build_engine(self):
-        """在工作线程中构建策略引擎"""
+        """在工作线程中构建策略引擎和卖出策略函数引用"""
         if self.engine_config is not None:
             self._engine = strategy_engine.build_engine_from_config(self.engine_config)
         else:
             self._engine = strategy_engine.build_default_engine()
+
+        # 解析卖出策略所需的函数引用，确保多因子模式下卖出逻辑与买入策略一致
+        self._sell_buy_func = getattr(CeLue, self.sell_buy_func_name, CeLue.策略2)
+        self._sell_func = getattr(CeLue, self.sell_func_name, CeLue.卖策略)
+        self.logger.info(f'卖出策略: 买入信号函数={self.sell_buy_func_name}, 卖出函数={self.sell_func_name}')
 
     def _update_hs300_signal(self):
         """更新 HS300 大盘信号"""
@@ -194,15 +223,21 @@ class StockMonitor:
             except Exception as e:
                 self.logger.debug(f'{stockcode} 策略引擎评估异常: {e}')
 
-        # 卖出策略评估（基于买入信号）
+        # 卖出策略评估：使用配置的买入信号函数生成历史信号序列，再传给卖出函数
+        # 多因子模式下 sell_buy_func 应与引擎主买入策略对应，确保买卖逻辑一致
         try:
-            buy_signal = CeLue.策略2(df_stock, self._hs300_signal) if self._hs300_signal is not None \
-                else CeLue.策略2(df_stock, pd.Series(True, index=df_stock.index))
-            sell_signal = CeLue.卖策略(df_stock, buy_signal)
-            if isinstance(sell_signal, pd.Series) and len(sell_signal) > 0:
-                result['sell'] = bool(sell_signal.iat[-1])
-                if result['sell'] and '卖策略' not in result['strategies']:
-                    result['strategies'].append('卖策略')
+            if self._sell_buy_func is not None and self._sell_func is not None:
+                hs300 = self._hs300_signal if self._hs300_signal is not None \
+                    else pd.Series(True, index=df_stock.index)
+                # 买入信号序列由配置的函数生成
+                buy_signal_series = self._sell_buy_func(df_stock, hs300)
+                sell_signal = self._sell_func(df_stock, buy_signal_series)
+                if isinstance(sell_signal, pd.Series) and len(sell_signal) > 0:
+                    result['sell'] = bool(sell_signal.iat[-1])
+                    if result['sell']:
+                        sell_label = self.sell_func_name
+                        if sell_label not in result['strategies']:
+                            result['strategies'].append(sell_label)
         except Exception as e:
             self.logger.debug(f'{stockcode} 卖出策略评估异常: {e}')
 
@@ -363,6 +398,8 @@ def _parse_args(argv):
     stocks = []
     interval = 30
     engine_config_path = None
+    sell_buy_func = '策略2'
+    sell_func = '卖策略'
     i = 0
     while i < len(argv):
         if argv[i] == '--interval' and i + 1 < len(argv):
@@ -371,16 +408,22 @@ def _parse_args(argv):
         elif argv[i] == '--multi' and i + 1 < len(argv):
             engine_config_path = argv[i + 1]
             i += 2
+        elif argv[i] == '--sell-buy-func' and i + 1 < len(argv):
+            sell_buy_func = argv[i + 1]
+            i += 2
+        elif argv[i] == '--sell-func' and i + 1 < len(argv):
+            sell_func = argv[i + 1]
+            i += 2
         elif len(argv[i]) == 6 and argv[i].isdigit():
             stocks.append(argv[i])
             i += 1
         else:
             i += 1
-    return stocks, interval, engine_config_path
+    return stocks, interval, engine_config_path, sell_buy_func, sell_func
 
 
 if __name__ == '__main__':
-    stocks, interval, engine_config_path = _parse_args(sys.argv[1:])
+    stocks, interval, engine_config_path, sell_buy_func, sell_func = _parse_args(sys.argv[1:])
 
     engine_config = None
     if engine_config_path:
@@ -393,6 +436,7 @@ if __name__ == '__main__':
 
     print(f'[bold]股票实时行情监控系统[/bold]')
     print(f'轮询间隔: {interval} 秒')
+    print(f'买入信号函数: {sell_buy_func} | 卖出函数: {sell_func}')
     if stocks:
         print(f'监控股票: {stocks}')
     else:
@@ -402,6 +446,8 @@ if __name__ == '__main__':
         stocklist=stocks if stocks else None,
         interval=interval,
         engine_config=engine_config,
+        sell_buy_func=sell_buy_func,
+        sell_func=sell_func,
     )
 
     monitor.start()

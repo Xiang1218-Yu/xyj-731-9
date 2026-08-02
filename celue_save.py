@@ -68,18 +68,28 @@ def init_sqlite_db(db_path):
     conn.close()
 
 
-def save_to_sqlite(db_path, df_signals):
+def save_to_sqlite(db_path, df_signals, batch_size=1000):
     """
     将策略信号 DataFrame 批量写入 SQLite 数据库。
+    使用 executemany + 事务批量提交，大幅提升大数据量写入性能。
     利用 INSERT OR REPLACE 实现增量更新。
+
+    :param batch_size: 每批提交的行数，默认1000
+    :return: 写入的总行数
     """
     if df_signals is None or len(df_signals) == 0:
         return 0
 
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
+    # 性能优化：WAL模式 + 正常同步级别，写入速度可提升数倍
+    cursor.execute('PRAGMA journal_mode = WAL')
+    cursor.execute('PRAGMA synchronous = NORMAL')
+
     rows_inserted = 0
     try:
+        # 预处理所有行为元组列表，避免 iterrows 逐行构造的开销
+        all_rows = []
         for _, row in df_signals.iterrows():
             buy_val = 1 if row.get('celue_buy', False) else 0
             sell_val = 1 if row.get('celue_sell', False) else 0
@@ -96,11 +106,7 @@ def save_to_sqlite(db_path, df_signals):
             else:
                 date_val = str(date_val)[:10]
 
-            cursor.execute('''
-                INSERT OR REPLACE INTO strategy_signals
-                (code, date, celue_buy, celue_sell, strategy, open, high, low, close)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
+            all_rows.append((
                 str(row['code']),
                 date_val,
                 buy_val,
@@ -111,8 +117,18 @@ def save_to_sqlite(db_path, df_signals):
                 float(row['low']) if pd.notna(row.get('low')) else None,
                 float(row['close']) if pd.notna(row.get('close')) else None,
             ))
-            rows_inserted += 1
-        conn.commit()
+
+        # 分批 executemany 写入，避免单次事务过大
+        sql = '''
+            INSERT OR REPLACE INTO strategy_signals
+            (code, date, celue_buy, celue_sell, strategy, open, high, low, close)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        '''
+        for i in range(0, len(all_rows), batch_size):
+            batch = all_rows[i:i + batch_size]
+            cursor.executemany(sql, batch)
+            conn.commit()
+            rows_inserted += len(batch)
     except Exception as e:
         conn.rollback()
         print(f'[red]SQLite 写入失败: {e}[/red]')
@@ -148,9 +164,10 @@ def celue_save(file_list, HS300_信号, tqdm_position=None):
             if 'celue_sell' in df.columns:
                 del df['celue_sell']
         df.set_index('date', drop=False, inplace=True)  # 时间为索引。方便与另外复权的DF表对齐合并
-        if not {'celue_buy', 'celue_buy'}.issubset(df.columns):
+        # 分别检查 celue_buy / celue_sell 列是否存在，缺失则插入；已存在则清洗脏数据
+        # （旧代码错误地写为 {'celue_buy', 'celue_buy'}，导致 celue_sell 列可能重复插入或漏检）
+        if 'celue_buy' not in df.columns:
             df.insert(df.shape[1], 'celue_buy', np.nan)  # 插入celue_buy列，赋值NaN
-            df.insert(df.shape[1], 'celue_sell', np.nan)  # 插入celue_sell列，赋值NaN
         else:
             # 由于make_fq时fillna将最新的空的celue单元格也填充为0，所以先恢复nan
             df['celue_buy'] = (df['celue_buy']
@@ -158,7 +175,9 @@ def celue_save(file_list, HS300_信号, tqdm_position=None):
                                .mask(df['celue_buy'] == 'False', False)
                                .mask(df['celue_buy'] == 'True', True)
                                )
-
+        if 'celue_sell' not in df.columns:
+            df.insert(df.shape[1], 'celue_sell', np.nan)  # 插入celue_sell列，赋值NaN
+        else:
             df['celue_sell'] = (df['celue_sell']
                                 .apply(lambda x: lambda_update0(x))
                                 .mask(df['celue_sell'] == 'False', False)
