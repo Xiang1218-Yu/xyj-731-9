@@ -1,10 +1,23 @@
 """
 为日线数据添加全部股票的历史策略买点列。
 由于策略需要随时修改调整，因此单独写了策略写入文件，没有整合进readTDX_lday.py
+
+更新内容：
+  - 多进程并行处理不同股票区间的策略信号计算
+  - 支持 SQLite 数据库持久化存储（字段：股票代码、交易日期、买入/卖出信号、触发策略、前复权价格）
+  - 保留原有 CSV 输出，向后兼容
+
+命令行参数：
+  del              完全重新生成策略信号
+  single           单进程执行（默认多进程）
+  --db [path]      启用 SQLite 存储，可指定数据库路径（默认 strategy_signals.db）
+  --no-csv         不输出 celue汇总.csv（默认仍输出）
+  --workers N      指定进程数
 """
 import os
 import sys
 import time
+import sqlite3
 from multiprocessing import Pool, RLock, freeze_support
 import numpy as np
 import pandas as pd
@@ -16,8 +29,97 @@ import func
 import user_config as ucfg
 
 # 变量定义
-要剔除的通达信概念 = ["ST板块", ]  # list类型。通达信软件中查看“概念板块”。
+要剔除的通达信概念 = ["ST板块", ]  # list类型。通达信软件中查看"概念板块"。
 要剔除的通达信行业 = ["T1002", ]  # list类型。记事本打开 通达信目录\incon.dat，查看#TDXNHY标签的行业代码。T1002=证券
+
+# 默认数据库路径
+DEFAULT_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'strategy_signals.db')
+
+
+def init_sqlite_db(db_path):
+    """
+    初始化 SQLite 数据库，创建策略信号表。
+    表结构：股票代码、交易日期、买入/卖出信号、触发策略、前复权开高低收价格
+    """
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS strategy_signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL,
+            date TEXT NOT NULL,
+            celue_buy INTEGER DEFAULT 0,
+            celue_sell INTEGER DEFAULT 0,
+            strategy TEXT DEFAULT '',
+            open REAL,
+            high REAL,
+            low REAL,
+            close REAL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(code, date)
+        )
+    ''')
+    # 创建索引以加速查询
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_signals_code ON strategy_signals(code)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_signals_date ON strategy_signals(date)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_signals_buy ON strategy_signals(celue_buy)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_signals_sell ON strategy_signals(celue_sell)')
+    conn.commit()
+    conn.close()
+
+
+def save_to_sqlite(db_path, df_signals):
+    """
+    将策略信号 DataFrame 批量写入 SQLite 数据库。
+    利用 INSERT OR REPLACE 实现增量更新。
+    """
+    if df_signals is None or len(df_signals) == 0:
+        return 0
+
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    rows_inserted = 0
+    try:
+        for _, row in df_signals.iterrows():
+            buy_val = 1 if row.get('celue_buy', False) else 0
+            sell_val = 1 if row.get('celue_sell', False) else 0
+            strategy_parts = []
+            if buy_val:
+                strategy_parts.append('策略2买入')
+            if sell_val:
+                strategy_parts.append('卖策略')
+            strategy_str = ','.join(strategy_parts)
+
+            date_val = row['date']
+            if hasattr(date_val, 'strftime'):
+                date_val = date_val.strftime('%Y-%m-%d')
+            else:
+                date_val = str(date_val)[:10]
+
+            cursor.execute('''
+                INSERT OR REPLACE INTO strategy_signals
+                (code, date, celue_buy, celue_sell, strategy, open, high, low, close)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                str(row['code']),
+                date_val,
+                buy_val,
+                sell_val,
+                strategy_str,
+                float(row['open']) if pd.notna(row.get('open')) else None,
+                float(row['high']) if pd.notna(row.get('high')) else None,
+                float(row['low']) if pd.notna(row.get('low')) else None,
+                float(row['close']) if pd.notna(row.get('close')) else None,
+            ))
+            rows_inserted += 1
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f'[red]SQLite 写入失败: {e}[/red]')
+        raise
+    finally:
+        conn.close()
+    return rows_inserted
 
 
 def celue_save(file_list, HS300_信号, tqdm_position=None):
@@ -85,8 +187,38 @@ def celue_save(file_list, HS300_信号, tqdm_position=None):
     return df_celue
 
 
+def _parse_args(argv):
+    """解析命令行参数"""
+    use_db = False
+    db_path = DEFAULT_DB_PATH
+    output_csv = True
+    workers = None
+    i = 0
+    while i < len(argv):
+        if argv[i] == '--db':
+            use_db = True
+            if i + 1 < len(argv) and not argv[i + 1].startswith('--'):
+                db_path = argv[i + 1]
+                i += 2
+            else:
+                i += 1
+        elif argv[i] == '--no-csv':
+            output_csv = False
+            i += 1
+        elif argv[i] == '--workers' and i + 1 < len(argv):
+            workers = int(argv[i + 1])
+            i += 2
+        else:
+            i += 1
+    return use_db, db_path, output_csv, workers
+
+
 if __name__ == '__main__':
     print(f'附带命令行参数 del 完全重新生成策略信号, 参数 single 单进程执行(默认多进程)')
+    print(f'附加参数 --db [path] 启用SQLite存储, --no-csv 不输出CSV, --workers N 指定进程数')
+
+    use_db, db_path, output_csv, workers = _parse_args(sys.argv[1:])
+
     starttime = time.time()
     df_hs300 = pd.read_csv(ucfg.tdx['csv_index'] + '/000300.csv', index_col=None, encoding='gbk', dtype={'code': str})
     df_hs300['date'] = pd.to_datetime(df_hs300['date'], format='%Y-%m-%d')  # 转为时间格式
@@ -96,41 +228,35 @@ if __name__ == '__main__':
 
     if 'del' in sys.argv[1:]:
         print(f'检测到参数 del, 完全重新生成策略信号')
+        # 如果启用 SQLite 且 del 模式，清空旧数据
+        if use_db and os.path.exists(db_path):
+            try:
+                conn = sqlite3.connect(db_path)
+                conn.execute('DELETE FROM strategy_signals')
+                conn.commit()
+                conn.close()
+                print(f'已清空 SQLite 数据库旧数据: {db_path}')
+            except Exception as e:
+                print(f'清空数据库失败: {e}')
+
+    # 初始化 SQLite 数据库
+    if use_db:
+        init_sqlite_db(db_path)
+        print(f'SQLite 数据库已就绪: {db_path}')
+
+    # 确定进程数
+    if workers is not None:
+        t_num = workers
+    elif os.cpu_count() > 8:
+        t_num = int(os.cpu_count() / 1.5)
+    else:
+        t_num = max(1, os.cpu_count() - 2)
 
     if 'single' in sys.argv[1:]:
         print(f'检测到参数 single, 单进程执行')
         df_celue = celue_save(stocklist, HS300_信号)
     else:
-        # 多线程。好像没啥效果提升
-        # threads = []
-        # t_num = 4  # 线程数
-        # for i in range(0, t_num):
-        #     div = int(len(stocklist) / t_num)
-        #     mod = len(stocklist) % t_num
-        #     if i+1 != t_num:
-        #         # print(i, i * div, (i + 1) * div)
-        #         threads.append(threading.Thread(target=celue_save, args=(stocklist[i*div:(i+1)*div], HS300_信号)))
-        #     else:
-        #         # print(i, i * div, (i + 1) * div + mod)
-        #         threads.append(threading.Thread(target=celue_save, args=(stocklist[i*div:(i+1)*div+mod], HS300_信号)))
-        # # celue_save(stocklist, HS300_信号)
-        #
-        # print(threads)
-        # for t in threads:
-        #     t.setDaemon(True)
-        #     t.start()
-        #
-        # for t in threads:
-        #     t.join()
-        # print("\n")
-
-        # 多进程
-        # print('Parent process %s' % os.getpid())
-        # 进程数 读取CPU逻辑处理器个数
-        if os.cpu_count() > 8:
-            t_num = int(os.cpu_count() / 1.5)
-        else:
-            t_num = os.cpu_count() - 2
+        print(f'多进程执行，进程数: {t_num}')
         freeze_support()  # for Windows support
         tqdm.set_lock(RLock())  # for managing output contention
         p = Pool(processes=t_num, initializer=tqdm.set_lock, initargs=(tqdm.get_lock(),))
@@ -139,15 +265,12 @@ if __name__ == '__main__':
             div = int(len(stocklist) / t_num)
             mod = len(stocklist) % t_num
             if i + 1 != t_num:
-                # print(i, i * div, (i + 1) * div)
-                pool_result.append(p.apply_async(celue_save, args=(stocklist[i * div:(i + 1) * div], HS300_信号, i)))
+                pool_result.append(
+                    p.apply_async(celue_save, args=(stocklist[i * div:(i + 1) * div], HS300_信号, i)))
             else:
-                # print(i, i * div, (i + 1) * div + mod)
                 pool_result.append(
                     p.apply_async(celue_save, args=(stocklist[i * div:(i + 1) * div + mod], HS300_信号, i)))
-        # celue_save(stocklist, HS300_信号)
 
-        # print('Waiting for all subprocesses done...')
         p.close()
         p.join()
 
@@ -157,7 +280,8 @@ if __name__ == '__main__':
         df_list = []
         for i in pool_result:
             df_list.append(i.get())
-        df_celue = pd.concat(df_list)
+        if df_list:
+            df_celue = pd.concat(df_list)
 
     # df_celue 是处理后的所有股票策略信号汇总文件。
     # 下面处理自定义股票板块剔除
@@ -190,13 +314,39 @@ if __name__ == '__main__':
     stocklist = list(filter(lambda i: i not in kicklist, stocklist))
     print(f'共 {len(stocklist)} 只候选股票')
     # df_celue 剔除在kicklist中的股票
-    df_celue = df_celue[~df_celue['code'].isin(kicklist)]
+    if len(df_celue) > 0:
+        df_celue = df_celue[~df_celue['code'].isin(kicklist)]
 
-    print(f'保存独立"celue汇总.csv"文件')
-    df_celue = (df_celue
-                .drop(["open", "high", "low", "vol", "amount", "adj", "流通股", "流通市值", "换手率"], axis=1)
-                .sort_index()
-                .reset_index(drop=True)
-                )
-    df_celue.to_csv(ucfg.tdx['csv_gbbq'] + os.sep + 'celue汇总.csv', index=True, encoding='gbk')
+    # 保存到 SQLite 数据库
+    if use_db:
+        print(f'写入 SQLite 数据库: {db_path}')
+        # 准备数据库写入数据（保留前复权价格字段）
+        df_db = df_celue.copy()
+        if len(df_db) > 0:
+            db_cols = ['code', 'date', 'celue_buy', 'celue_sell', 'open', 'high', 'low', 'close']
+            available_cols = [c for c in db_cols if c in df_db.columns]
+            df_db = df_db[available_cols]
+            rows = save_to_sqlite(db_path, df_db)
+            print(f'SQLite 写入完成，共 {rows} 条信号记录')
+        else:
+            print('无信号数据需要写入 SQLite')
+
+    # 保存独立"celue汇总.csv"文件（向后兼容）
+    if output_csv:
+        print(f'保存独立"celue汇总.csv"文件')
+        if len(df_celue) > 0:
+            drop_cols = ["open", "high", "low", "vol", "amount", "adj", "流通股", "流通市值", "换手率"]
+            existing_drop = [c for c in drop_cols if c in df_celue.columns]
+            df_csv = (df_celue
+                      .drop(existing_drop, axis=1)
+                      .sort_index()
+                      .reset_index(drop=True)
+                      )
+            df_csv.to_csv(ucfg.tdx['csv_gbbq'] + os.sep + 'celue汇总.csv', index=True, encoding='gbk')
+        else:
+            # 空结果也生成空CSV，避免下游程序报错
+            pd.DataFrame(columns=['code', 'date', 'close', 'celue_buy', 'celue_sell']).to_csv(
+                ucfg.tdx['csv_gbbq'] + os.sep + 'celue汇总.csv', index=True, encoding='gbk')
+        print(f'celue汇总.csv 已保存')
+
     print(f'用时 {(time.time() - starttime):.2f} 秒, 全部处理完成，程序退出')
