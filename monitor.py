@@ -42,6 +42,10 @@ import user_config as ucfg
 class StockMonitor:
     """实时行情监控器。后台线程持续获取行情并运行策略，触发信号时生成预警"""
 
+    # 类级线程锁：_alert 的去重判断与CSV追加写是复合操作，
+    # 多线程/多监控实例并发时保证同进程内写入不交错
+    _alert_lock = threading.Lock()
+
     def __init__(self, watchlist, interval=None, use_multi_factor=None,
                  lookback=None, start_date=None, end_date=None):
         """
@@ -224,21 +228,23 @@ class StockMonitor:
         return round(float(df_stock['close'].at[bar]), 2)
 
     def _alert(self, code, signal, price, trigger_strategies, bar):
-        """生成预警：同一股票同一信号在同一信号周期只预警一次。写预警日志+信号CSV"""
+        """生成预警：同一股票同一信号在同一信号周期只预警一次。写预警日志+信号CSV。
+        去重判断+CSV追加写为复合操作，整体持有类级线程锁，多线程并发预警时不交错"""
         bar_str = pd.to_datetime(bar).strftime('%Y-%m-%d')  # 信号所在交易日
-        key = (code, signal, bar_str)
-        if key in self._alerted:
-            return
-        self._alerted.add(key)
-        trigger = '|'.join(trigger_strategies)
-        now = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
-        # 预警日志：预警时间、股票代码、信号类型、信号日期、价格、触发策略
-        self.logger.warning(f'[{signal}预警] {code} 信号日期 {bar_str} 价格 {price} 触发策略: {trigger}')
-        # 信号CSV：供其他程序（如自动化交易）读取
-        row = pd.DataFrame([{'signal_time': now, 'code': code, 'signal': signal, 'signal_date': bar_str,
-                             'price': price, 'trigger_strategy': trigger}])
-        row.to_csv(self.alert_csv, mode='a', index=False,
-                   header=not os.path.exists(self.alert_csv), encoding='gbk')
+        with StockMonitor._alert_lock:
+            key = (code, signal, bar_str)
+            if key in self._alerted:
+                return
+            self._alerted.add(key)
+            trigger = '|'.join(trigger_strategies)
+            now = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+            # 预警日志：预警时间、股票代码、信号类型、信号日期、价格、触发策略
+            self.logger.warning(f'[{signal}预警] {code} 信号日期 {bar_str} 价格 {price} 触发策略: {trigger}')
+            # 信号CSV：供其他程序（如自动化交易）读取
+            row = pd.DataFrame([{'signal_time': now, 'code': code, 'signal': signal, 'signal_date': bar_str,
+                                 'price': price, 'trigger_strategy': trigger}])
+            row.to_csv(self.alert_csv, mode='a', index=False,
+                       header=not os.path.exists(self.alert_csv), encoding='gbk')
 
 
 def load_default_watchlist():

@@ -1,3 +1,4 @@
+import contextlib
 import os
 import copy
 import sqlite3
@@ -340,15 +341,54 @@ def print_analysis(metrics):
            f"\t平均盈利 {metrics['平均盈利']:>.2%}\t平均亏损 {metrics['平均亏损']:>.2%}")
 
 
+@contextlib.contextmanager
+def _interprocess_file_lock(lock_path):
+    """
+    跨进程文件锁。多进程并发回测或快速连续回测时，防止 analysis汇总.csv 追加写竞争。
+    POSIX 使用 fcntl.flock，Windows 使用 msvcrt.locking，均不可用时退化为无锁（不报错）
+    """
+    lock_file = open(lock_path, 'a')
+    locker = None
+    try:
+        try:
+            import fcntl  # POSIX (Linux/macOS)
+            locker = 'fcntl'
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        except ImportError:
+            try:
+                import msvcrt  # Windows
+                locker = 'msvcrt'
+                lock_file.seek(0)
+                while True:
+                    try:
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+                        break
+                    except OSError:
+                        time.sleep(0.1)  # 锁被占用，轮询等待
+            except ImportError:
+                pass  # 无可用锁机制时退化为无锁
+        yield
+    finally:
+        try:
+            if locker == 'fcntl':
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            elif locker == 'msvcrt':
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        finally:
+            lock_file.close()
+
+
 def save_analysis(metrics, result_name):
     """
     持久化回测结果分析：
     1. 与回测pkl/png同目录的 <回测文件名>_analysis.txt 文本报告
     2. 追加一行到 rq_result/analysis汇总.csv，便于多次回测横向对比
+       （追加写持有跨进程文件锁，多进程并发回测时不会写入竞争）
     :param metrics: analyze_result返回的指标dict
     :param result_name: 回测结果文件路径前缀（rq_result_filename，不含扩展名）
     """
-    # 1. 文本报告
+    # 1. 文本报告（文件名按回测时间戳区分，天然无竞争）
     txt_path = result_name + '_analysis.txt'
     with open(txt_path, 'w', encoding='utf-8') as f:
         f.write(f'回测结果分析 {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}\n')
@@ -358,8 +398,10 @@ def save_analysis(metrics, result_name):
     csv_path = os.path.join('rq_result', 'analysis汇总.csv')
     row = pd.DataFrame([metrics])
     row.insert(0, '回测文件', os.path.basename(result_name))
-    row.to_csv(csv_path, mode='a', index=False,
-               header=not os.path.exists(csv_path), encoding='gbk')
+    # 表头判断与追加写必须处于同一把锁内，避免并发进程重复写表头或行交错
+    with _interprocess_file_lock(csv_path + '.lock'):
+        row.to_csv(csv_path, mode='a', index=False,
+                   header=not os.path.exists(csv_path), encoding='gbk')
     rprint(f'分析结果已持久化: {txt_path} 及 {csv_path}')
 
 
