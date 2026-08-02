@@ -26,6 +26,11 @@ import celue_engine  # 多因子选股策略引擎
 import func
 import user_config as ucfg
 
+# 配置部分
+
+start_date = ''
+end_date = ''
+
 # 变量定义
 要剔除的通达信概念 = ["ST板块", ]  # list类型。通达信软件中查看“概念板块”。
 要剔除的通达信行业 = ["T1002", ]  # list类型。记事本打开 通达信目录\incon.dat，查看#TDXNHY标签的行业代码。T1002=证券
@@ -71,7 +76,9 @@ def make_trigger_column(df, HS300_信号):
     """
     if 'multi' in sys.argv[1:]:
         engine = celue_engine.MultiFactorEngine()
-        context = {'HS300_信号': HS300_信号, '_cache': {}}
+        # 策略上下文与xuangu.py的run_multi保持一致，含HS300_信号/start_date/end_date
+        context = {'HS300_信号': HS300_信号, 'start_date': start_date, 'end_date': end_date,
+                   '_cache': {}}
         trigger = pd.Series('', index=df.index, dtype=object)
         for f in engine.factors:
             name = ('NOT ' if f.get('not', False) else '') + f['name']

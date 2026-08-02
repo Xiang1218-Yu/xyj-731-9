@@ -293,11 +293,24 @@ def analyze_result(result_dict, rf=RISK_FREE_RATE):
     """
     metrics = {}
     # ---- 基于每日净值的指标 ----
+    # 输入防御性校验：result_dict结构不符合预期时抛出明确的ValueError，而不是KeyError崩溃
+    if not isinstance(result_dict, dict):
+        raise ValueError(f'result_dict格式错误：期望dict，实际为 {type(result_dict).__name__}')
     # 兼容rqalpha不同版本的pkl结构：4.x为total_portfolios，5.x+为portfolio
     df_port = result_dict.get('total_portfolios')
     if df_port is None:
-        df_port = result_dict['portfolio']
+        df_port = result_dict.get('portfolio')
+    if df_port is None:
+        raise ValueError('result_dict格式错误：缺少 total_portfolios 或 portfolio 每日净值表')
+    if 'unit_net_value' not in df_port.columns:
+        raise ValueError(f'result_dict格式错误：净值表缺少 unit_net_value 字段，'
+                         f'现有字段: {list(df_port.columns)}')
     nv = df_port['unit_net_value'].astype(float)  # 每日单位净值
+    nv = nv.dropna()
+    if len(nv) < 2:
+        raise ValueError(f'净值数据不足（有效周期数 {len(nv)} < 2），无法计算收益率类指标')
+    if nv.iloc[0] == 0:
+        raise ValueError('首期单位净值为0，数据异常，无法计算收益率类指标')
     daily_ret = nv.pct_change().dropna()  # 日收益率序列
     trading_days = len(daily_ret)
     total_returns = float(nv.iloc[-1] / nv.iloc[0] - 1)  # 累计收益率
@@ -418,7 +431,12 @@ if __name__ == '__main__':
             pkl_files = [os.path.join('rq_result', f) for f in os.listdir('rq_result') if f.endswith('.pkl')]
             pkl_path = max(pkl_files, key=os.path.getmtime)
         rprint(f'分析回测结果文件: {pkl_path}')
-        print_analysis(analyze_result(pd.read_pickle(pkl_path)))
+        try:
+            print_analysis(analyze_result(pd.read_pickle(pkl_path)))
+        except ValueError as e:
+            # 输入格式错误时给出明确提示，不崩溃
+            rprint(f'[red]回测结果分析失败: {e}[/red]')
+            sys.exit(1)
         sys.exit(0)
 
     # 使用 run_func 函数来运行策略
@@ -471,6 +489,10 @@ if __name__ == '__main__':
         f"\t最大回撤 {result_dict['summary']['max_drawdown']:>.2%}"
         f"\n打开程序文件夹下的rq_result.png查看收益走势图")
     # 回测流程结束后自动执行结果分析：输出夏普比率、最大回撤、胜率等统计指标，并持久化到文件
-    metrics = analyze_result(result_dict)
-    print_analysis(metrics)
-    save_analysis(metrics, rq_result_filename)
+    # 分析异常不影响回测主流程，仅提示
+    try:
+        metrics = analyze_result(result_dict)
+        print_analysis(metrics)
+        save_analysis(metrics, rq_result_filename)
+    except ValueError as e:
+        rprint(f'[yellow]回测结果分析失败: {e}[/yellow]')
