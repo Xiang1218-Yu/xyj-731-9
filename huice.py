@@ -1,5 +1,8 @@
+import contextlib
 import os
 import copy
+import sqlite3
+import sys
 import time
 import pickle
 import talib
@@ -36,6 +39,31 @@ def update_stockcode(stockcode):
     return stockcode
 
 
+def read_celue_signals():
+    """
+    读取回测策略信号。默认优先读取SQLite数据库 celue.db（celue_save.py生成），
+    数据库不存在或附带命令行参数 csv 时，读取旧版 celue汇总.csv
+    :return: DF格式，策略买卖信号汇总
+    """
+    db_path = ucfg.tdx['csv_gbbq'] + os.sep + 'celue.db'
+    if 'csv' not in sys.argv[1:] and os.path.exists(db_path):
+        # 从SQLite数据库读取（新持久化格式，含触发策略、前复权价格字段）
+        conn = sqlite3.connect(db_path)
+        try:
+            df_celue = pd.read_sql('SELECT * FROM celue_signals', conn, dtype={'code': str})
+        finally:
+            conn.close()
+        df_celue['celue_buy'] = df_celue['celue_buy'].astype(bool)
+        df_celue['celue_sell'] = df_celue['celue_sell'].astype(bool)
+    else:
+        df_celue = pd.read_csv(ucfg.tdx['csv_gbbq'] + os.sep + 'celue汇总.csv',
+                               index_col=0, encoding='gbk', dtype={'code': str})
+    df_celue['code'] = df_celue['code'].apply(lambda x: update_stockcode(x))  # 升级股票代码，匹配rqalpha
+    df_celue['date'] = pd.to_datetime(df_celue['date'], format='%Y-%m-%d')  # 转为时间格式
+    df_celue.set_index('date', drop=False, inplace=True)  # 时间为索引
+    return df_celue
+
+
 # 在这个方法中编写任何的初始化逻辑。context对象将会在你的算法策略的任何方法之间做传递。
 def init(context):
     # 在context中保存全局变量
@@ -43,12 +71,7 @@ def init(context):
     context.target_value = xiadan_target_value  # 设定具体股票总买入市值
     context.order_type = order_type  # 下单模式
 
-    df_celue = pd.read_csv(ucfg.tdx['csv_gbbq'] + os.sep + 'celue汇总.csv',
-                           index_col=0, encoding='gbk', dtype={'code': str})
-    df_celue['code'] = df_celue['code'].apply(lambda x: update_stockcode(x))  # 升级股票代码，匹配rqalpha
-    df_celue['date'] = pd.to_datetime(df_celue['date'], format='%Y-%m-%d')  # 转为时间格式
-    df_celue.set_index('date', drop=False, inplace=True)  # 时间为索引
-    context.df_celue = df_celue
+    context.df_celue = read_celue_signals()
 
 
 # before_trading此函数会在每天策略交易开始前被调用，当天只会被调用一次
@@ -217,54 +240,259 @@ __config__ = {
     },
 }
 
+# ==================== 回测结果分析功能 ====================
+RISK_FREE_RATE = 0.03  # 无风险年化利率，夏普比率计算使用
+
+
+def extract_trade_returns(result_dict):
+    """
+    从交割单(trades)提取每笔已平仓交易的收益率序列。
+    优先使用after_trading合并的"盈亏率"列；不存在时按先进先出(FIFO)配对买卖单计算
+    :return: pd.Series 每笔交易的收益率
+    """
+    df_trades = result_dict.get('trades')
+    if df_trades is None or len(df_trades) == 0:
+        return pd.Series(dtype=float)
+    if '盈亏率' in df_trades.columns:
+        ret = df_trades.loc[df_trades['side'].astype(str).str.upper().str.endswith('SELL'), '盈亏率'].dropna()
+        if len(ret) > 0:
+            return ret.astype(float)
+    # 无盈亏率列：按股票FIFO配对买卖单，逐笔计算收益率
+    # 兼容rqalpha不同版本交割单字段：4.x为price/quantity，5.x+为last_price/last_quantity
+    col_price = 'price' if 'price' in df_trades.columns else 'last_price'
+    col_qty = 'quantity' if 'quantity' in df_trades.columns else 'last_quantity'
+    if col_price not in df_trades.columns or col_qty not in df_trades.columns:
+        return pd.Series(dtype=float)
+    returns = []
+    buy_queues = {}  # 每只股票未平仓的买入队列 [[价格, 数量], ...]
+    for _, trade in df_trades.sort_index().iterrows():
+        book = trade['order_book_id']
+        side = str(trade['side']).upper()
+        queue = buy_queues.setdefault(book, [])
+        if side.endswith('BUY'):
+            queue.append([trade[col_price], trade[col_qty]])
+        elif side.endswith('SELL') and queue:
+            remain = trade[col_qty]
+            while remain > 0 and queue:
+                lot = queue[0]
+                matched = min(lot[1], remain)
+                returns.append(trade[col_price] / lot[0] - 1)
+                lot[1] -= matched
+                remain -= matched
+                if lot[1] <= 0:
+                    queue.pop(0)
+    return pd.Series(returns, dtype=float)
+
+
+def analyze_result(result_dict, rf=RISK_FREE_RATE):
+    """
+    回测结果统计分析，输出夏普比率、最大回撤、胜率等指标
+    :param result_dict: rqalpha输出的pkl内容dict（含total_portfolios/trades/summary）
+    :param rf: 无风险年化利率
+    :return: dict 统计指标
+    """
+    metrics = {}
+    # ---- 基于每日净值的指标 ----
+    # 输入防御性校验：result_dict结构不符合预期时抛出明确的ValueError，而不是KeyError崩溃
+    if not isinstance(result_dict, dict):
+        raise ValueError(f'result_dict格式错误：期望dict，实际为 {type(result_dict).__name__}')
+    # 兼容rqalpha不同版本的pkl结构：4.x为total_portfolios，5.x+为portfolio
+    df_port = result_dict.get('total_portfolios')
+    if df_port is None:
+        df_port = result_dict.get('portfolio')
+    if df_port is None:
+        raise ValueError('result_dict格式错误：缺少 total_portfolios 或 portfolio 每日净值表')
+    if 'unit_net_value' not in df_port.columns:
+        raise ValueError(f'result_dict格式错误：净值表缺少 unit_net_value 字段，'
+                         f'现有字段: {list(df_port.columns)}')
+    nv = df_port['unit_net_value'].astype(float)  # 每日单位净值
+    nv = nv.dropna()
+    if len(nv) < 2:
+        raise ValueError(f'净值数据不足（有效周期数 {len(nv)} < 2），无法计算收益率类指标')
+    if nv.iloc[0] == 0:
+        raise ValueError('首期单位净值为0，数据异常，无法计算收益率类指标')
+    daily_ret = nv.pct_change().dropna()  # 日收益率序列
+    trading_days = len(daily_ret)
+    total_returns = float(nv.iloc[-1] / nv.iloc[0] - 1)  # 累计收益率
+    # 年化收益率（按252个交易日复合）
+    annualized = float((1 + total_returns) ** (252 / trading_days) - 1) if trading_days > 0 else 0.0
+    volatility = float(daily_ret.std() * np.sqrt(252))  # 年化波动率
+    sharpe = (annualized - rf) / volatility if volatility > 0 else 0.0  # 夏普比率
+    max_dd = float((nv / nv.cummax() - 1).min())  # 最大回撤（负值）
+    calmar = annualized / abs(max_dd) if max_dd < 0 else 0.0  # 卡玛比率
+    # ---- 基于交割单的交易统计 ----
+    trade_returns = extract_trade_returns(result_dict)
+    wins = trade_returns[trade_returns > 0]
+    losses = trade_returns[trade_returns <= 0]
+    win_rate = float(len(wins) / len(trade_returns)) if len(trade_returns) > 0 else 0.0  # 胜率
+    pl_ratio = float(wins.mean() / abs(losses.mean())) if len(wins) > 0 and len(losses) > 0 else np.nan  # 盈亏比
+
+    metrics['回测交易日数'] = trading_days
+    metrics['累计收益率'] = total_returns
+    metrics['年化收益率'] = annualized
+    metrics['年化波动率'] = volatility
+    metrics['夏普比率'] = sharpe
+    metrics['最大回撤'] = max_dd
+    metrics['卡玛比率'] = calmar
+    metrics['平仓交易次数'] = len(trade_returns)
+    metrics['胜率'] = win_rate
+    metrics['盈亏比'] = pl_ratio
+    metrics['平均盈利'] = float(wins.mean()) if len(wins) > 0 else np.nan
+    metrics['平均亏损'] = float(losses.mean()) if len(losses) > 0 else np.nan
+    return metrics
+
+
+def print_analysis(metrics):
+    """格式化输出回测结果分析指标"""
+    rprint('\n========== 回测结果分析 ==========')
+    rprint(f"回测交易日数 {metrics['回测交易日数']}"
+           f"\n累计收益率 {metrics['累计收益率']:>.2%}\t年化收益率 {metrics['年化收益率']:>.2%}"
+           f"\n年化波动率 {metrics['年化波动率']:>.2%}\t夏普比率 {metrics['夏普比率']:>.2f}"
+           f"\n最大回撤 {metrics['最大回撤']:>.2%}\t卡玛比率 {metrics['卡玛比率']:>.2f}"
+           f"\n平仓交易次数 {metrics['平仓交易次数']}\t胜率 {metrics['胜率']:>.2%}"
+           f"\n盈亏比 {metrics['盈亏比']:>.2f}"
+           f"\t平均盈利 {metrics['平均盈利']:>.2%}\t平均亏损 {metrics['平均亏损']:>.2%}")
+
+
+@contextlib.contextmanager
+def _interprocess_file_lock(lock_path):
+    """
+    跨进程文件锁。多进程并发回测或快速连续回测时，防止 analysis汇总.csv 追加写竞争。
+    POSIX 使用 fcntl.flock，Windows 使用 msvcrt.locking，均不可用时退化为无锁（不报错）
+    """
+    lock_file = open(lock_path, 'a')
+    locker = None
+    try:
+        try:
+            import fcntl  # POSIX (Linux/macOS)
+            locker = 'fcntl'
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        except ImportError:
+            try:
+                import msvcrt  # Windows
+                locker = 'msvcrt'
+                lock_file.seek(0)
+                while True:
+                    try:
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+                        break
+                    except OSError:
+                        time.sleep(0.1)  # 锁被占用，轮询等待
+            except ImportError:
+                pass  # 无可用锁机制时退化为无锁
+        yield
+    finally:
+        try:
+            if locker == 'fcntl':
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            elif locker == 'msvcrt':
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        finally:
+            lock_file.close()
+
+
+def save_analysis(metrics, result_name):
+    """
+    持久化回测结果分析：
+    1. 与回测pkl/png同目录的 <回测文件名>_analysis.txt 文本报告
+    2. 追加一行到 rq_result/analysis汇总.csv，便于多次回测横向对比
+       （追加写持有跨进程文件锁，多进程并发回测时不会写入竞争）
+    :param metrics: analyze_result返回的指标dict
+    :param result_name: 回测结果文件路径前缀（rq_result_filename，不含扩展名）
+    """
+    # 1. 文本报告（文件名按回测时间戳区分，天然无竞争）
+    txt_path = result_name + '_analysis.txt'
+    with open(txt_path, 'w', encoding='utf-8') as f:
+        f.write(f'回测结果分析 {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}\n')
+        for k, v in metrics.items():
+            f.write(f'{k}: {v:.4f}\n' if isinstance(v, float) else f'{k}: {v}\n')
+    # 2. 汇总CSV。首列为回测文件名，后续列为各指标
+    csv_path = os.path.join('rq_result', 'analysis汇总.csv')
+    row = pd.DataFrame([metrics])
+    row.insert(0, '回测文件', os.path.basename(result_name))
+    # 表头判断与追加写必须处于同一把锁内，避免并发进程重复写表头或行交错
+    with _interprocess_file_lock(csv_path + '.lock'):
+        row.to_csv(csv_path, mode='a', index=False,
+                   header=not os.path.exists(csv_path), encoding='gbk')
+    rprint(f'分析结果已持久化: {txt_path} 及 {csv_path}')
+
+
 start_time = f'程序开始时间：{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}'
 
-# 使用 run_func 函数来运行策略
-# 此种模式下，您只需要在当前环境下定义策略函数，并传入指定运行的函数，即可运行策略。
-# 如果你的函数命名是按照 API 规范来，则可以直接按照以下方式来运行
-run_func(**globals())
-end_time = f'程序结束时间：{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}'
+if __name__ == '__main__':
+    # 分析模式：python huice.py analyze [rq_result/xxx.pkl]
+    # 不执行回测，直接分析已有的回测结果pkl文件，输出夏普比率、最大回撤、胜率等指标
+    if 'analyze' in sys.argv[1:]:
+        arg_index = sys.argv.index('analyze')
+        pkl_path = sys.argv[arg_index + 1] if arg_index + 1 < len(sys.argv) else None
+        if pkl_path is None:
+            # 未指定文件时，使用rq_result目录下最新的pkl
+            pkl_files = [os.path.join('rq_result', f) for f in os.listdir('rq_result') if f.endswith('.pkl')]
+            pkl_path = max(pkl_files, key=os.path.getmtime)
+        rprint(f'分析回测结果文件: {pkl_path}')
+        try:
+            print_analysis(analyze_result(pd.read_pickle(pkl_path)))
+        except ValueError as e:
+            # 输入格式错误时给出明确提示，不崩溃
+            rprint(f'[red]回测结果分析失败: {e}[/red]')
+            sys.exit(1)
+        sys.exit(0)
 
-# RQAlpha可以输出一个 pickle 文件，里面为一个 dict 。keys 包括
-# summary 回测摘要
-# stock_portfolios 股票帐号的市值
-# future_portfolios 期货帐号的市值
-# total_portfolios 总账号的的市值
-# benchmark_portfolios 基准帐号的市值
-# stock_positions 股票持仓
-# future_positions 期货仓位
-# benchmark_positions 基准仓位
-# trades 交易详情（交割单）
-# plots 调用plot画图时，记录的值
-result_dict = pd.read_pickle(rq_result_filename + ".pkl")
+    # 使用 run_func 函数来运行策略
+    # 此种模式下，您只需要在当前环境下定义策略函数，并传入指定运行的函数，即可运行策略。
+    # 如果你的函数命名是按照 API 规范来，则可以直接按照以下方式来运行
+    run_func(**globals())
+    end_time = f'程序结束时间：{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}'
 
-# 给rq_result.pkl的交割单添加个股盈亏和收益率统计
-df_trades = result_dict['trades']
-try:
-    df_temp = pd.read_csv('temp.csv', index_col=0, encoding='gbk')
-    if 'trading_datetime' in df_temp.columns:
-        df_temp = df_temp.set_index('trading_datetime')
-    df_temp.index.name = 'datetime'
-    # 避免列名冲突，重命名列
-    df_temp = df_temp.rename(columns=lambda x: x + '_temp' if x in df_trades.columns else x)
-    df_trades = pd.merge(df_trades, df_temp, left_index=True, right_index=True, how='left')
-    result_dict['trades'] = df_trades
-except FileNotFoundError:
-    print("temp.csv 不存在，跳过合并")
-except Exception as e:
-    print(f"合并交割单数据出错: {e}")
-with open(rq_result_filename+".pkl", 'wb') as fobj:
-    pickle.dump(result_dict, fobj)
-os.remove('temp.csv') if os.path.exists("temp.csv") else None
+    # RQAlpha可以输出一个 pickle 文件，里面为一个 dict 。keys 包括
+    # summary 回测摘要
+    # stock_portfolios 股票帐号的市值
+    # future_portfolios 期货帐号的市值
+    # total_portfolios 总账号的的市值
+    # benchmark_portfolios 基准帐号的市值
+    # stock_positions 股票持仓
+    # future_positions 期货仓位
+    # benchmark_positions 基准仓位
+    # trades 交易详情（交割单）
+    # plots 调用plot画图时，记录的值
+    result_dict = pd.read_pickle(rq_result_filename + ".pkl")
+
+    # 给rq_result.pkl的交割单添加个股盈亏和收益率统计
+    df_trades = result_dict['trades']
+    try:
+        df_temp = pd.read_csv('temp.csv', index_col=0, encoding='gbk')
+        if 'trading_datetime' in df_temp.columns:
+            df_temp = df_temp.set_index('trading_datetime')
+        df_temp.index.name = 'datetime'
+        # 避免列名冲突，重命名列
+        df_temp = df_temp.rename(columns=lambda x: x + '_temp' if x in df_trades.columns else x)
+        df_trades = pd.merge(df_trades, df_temp, left_index=True, right_index=True, how='left')
+        result_dict['trades'] = df_trades
+    except FileNotFoundError:
+        print("temp.csv 不存在，跳过合并")
+    except Exception as e:
+        print(f"合并交割单数据出错: {e}")
+    with open(rq_result_filename+".pkl", 'wb') as fobj:
+        pickle.dump(result_dict, fobj)
+    os.remove('temp.csv') if os.path.exists("temp.csv") else None
 
 
-rprint(result_dict["summary"])
-rprint(start_time)
-rprint(end_time)
-rprint(
-    f"回测起点 {result_dict['summary']['start_date']}"
-    f"\n回测终点 {result_dict['summary']['end_date']}"
-    f"\n回测收益 {result_dict['summary']['total_returns']:>.2%}\t年化收益 {result_dict['summary']['annualized_returns']:>.2%}"
-    f"\t基准收益 {result_dict['summary']['benchmark_total_returns']:>.2%}\t基准年化 {result_dict['summary']['benchmark_annualized_returns']:>.2%}"
-    f"\t最大回撤 {result_dict['summary']['max_drawdown']:>.2%}"
-    f"\n打开程序文件夹下的rq_result.png查看收益走势图")
+    rprint(result_dict["summary"])
+    rprint(start_time)
+    rprint(end_time)
+    rprint(
+        f"回测起点 {result_dict['summary']['start_date']}"
+        f"\n回测终点 {result_dict['summary']['end_date']}"
+        f"\n回测收益 {result_dict['summary']['total_returns']:>.2%}\t年化收益 {result_dict['summary']['annualized_returns']:>.2%}"
+        f"\t基准收益 {result_dict['summary']['benchmark_total_returns']:>.2%}\t基准年化 {result_dict['summary']['benchmark_annualized_returns']:>.2%}"
+        f"\t最大回撤 {result_dict['summary']['max_drawdown']:>.2%}"
+        f"\n打开程序文件夹下的rq_result.png查看收益走势图")
+    # 回测流程结束后自动执行结果分析：输出夏普比率、最大回撤、胜率等统计指标，并持久化到文件
+    # 分析异常不影响回测主流程，仅提示
+    try:
+        metrics = analyze_result(result_dict)
+        print_analysis(metrics)
+        save_analysis(metrics, rq_result_filename)
+    except ValueError as e:
+        rprint(f'[yellow]回测结果分析失败: {e}[/yellow]')

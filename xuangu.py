@@ -10,6 +10,7 @@ from multiprocessing import Pool, RLock, freeze_support
 from rich import print
 from tqdm import tqdm
 import CeLue  # 个人策略文件，不分享
+import celue_engine  # 多因子选股策略引擎
 import func
 import user_config as ucfg
 
@@ -121,12 +122,48 @@ def run_celue2(stocklist, HS300_信号, df_gbbq, df_today, tqdm_position=None):
     return stocklist
 
 
+def run_multi(stocklist, HS300_信号, df_gbbq, df_today, tqdm_position=None):
+    """
+    多因子组合选股执行函数（多进程worker）。返回每只股票的评估结果dict列表，
+    包含匹配的子策略列表(matched_strategies)和综合评分(score)
+    """
+    engine = celue_engine.MultiFactorEngine()  # 每个子进程内构造引擎，读取user_config.multi_factor
+    result_list = []
+    if 'single' in sys.argv[1:]:
+        tq = tqdm(stocklist[:])
+    else:
+        tq = tqdm(stocklist[:], leave=False, position=tqdm_position)
+    for stockcode in tq:
+        tq.set_description(stockcode)
+        pklfile = csvdaypath + os.sep + stockcode + '.pkl'
+        df_stock = pd.read_pickle(pklfile)
+        df_stock['date'] = pd.to_datetime(df_stock['date'], format='%Y-%m-%d')  # 转为时间格式
+        df_stock.set_index('date', drop=False, inplace=True)  # 时间为索引。方便与另外复权的DF表对齐合并
+        if '09:00:00' < time.strftime("%H:%M:%S", time.localtime()) < '16:00:00' \
+                and 0 <= time.localtime(time.time()).tm_wday <= 4 and df_today is not None:
+            df_today_code = df_today.loc[df_today['code'] == stockcode]
+            df_stock = func.update_stockquote(stockcode, df_stock, df_today_code)
+            # 判断今天是否在该股的权息日内。如果是，需要重新前复权
+            now_date = pd.to_datetime(time.strftime("%Y-%m-%d", time.localtime()))
+            if now_date in df_gbbq.loc[df_gbbq['code'] == stockcode]['权息日'].to_list():
+                cw_dict = func.readall_local_cwfile()
+                df_stock = func.make_fq(stockcode, df_stock, df_gbbq, cw_dict)
+        # 策略上下文。多因子引擎按配置计算各因子序列
+        context = {'HS300_信号': HS300_信号, 'start_date': start_date, 'end_date': end_date}
+        result = engine.evaluate_stock(stockcode, df_stock, context)
+        if result.passed:
+            result_list.append(result.to_dict())
+    return result_list
+
+
 # 主程序开始
 if __name__ == '__main__':
     if 'single' in sys.argv[1:]:
         print(f'检测到参数 single, 单进程执行')
     else:
         print(f'附带命令行参数 single 单进程执行(默认多进程)')
+    if 'multi' in sys.argv[1:]:
+        print(f'检测到参数 multi, 使用多因子组合选股模式')
 
     stocklist = make_stocklist()
     print(f'共 {len(stocklist)} 只候选股票')
@@ -177,6 +214,56 @@ if __name__ == '__main__':
         except FileNotFoundError:
             pass
         df_today = None
+
+    # ==================== 多因子组合选股模式 ====================
+    # 命令行参数 multi 启用。同时配置多个策略，支持AND/OR/NOT逻辑组合，
+    # 输出每个股票匹配的子策略列表和综合评分。配置见user_config.multi_factor
+    if 'multi' in sys.argv[1:]:
+        engine_cfg = ucfg.multi_factor
+        enabled_factors = [f for f in engine_cfg['factors'] if f.get('enabled', True)]
+        print(f'多因子配置: {[f["name"] for f in enabled_factors]} logic={engine_cfg["logic"]} '
+              f'评分门槛={engine_cfg.get("score_threshold", 0)}')
+        print(f'开始执行多因子组合选股')
+        starttime_tick = time.time()
+        if 'single' in sys.argv[1:]:
+            multi_results = run_multi(stocklist, HS300_信号, df_gbbq, df_today)
+        else:
+            # 进程数 读取CPU逻辑处理器个数
+            if os.cpu_count() > 8:
+                t_num = int(os.cpu_count() / 1.5)
+            else:
+                t_num = os.cpu_count() - 2
+            freeze_support()  # for Windows support
+            tqdm.set_lock(RLock())  # for managing output contention
+            p = Pool(processes=t_num, initializer=tqdm.set_lock, initargs=(tqdm.get_lock(),))
+            pool_result = []  # 存放pool池的返回对象列表
+            for i in range(0, t_num):
+                div = int(len(stocklist) / t_num)
+                mod = len(stocklist) % t_num
+                if i + 1 != t_num:
+                    pool_result.append(p.apply_async(run_multi, args=(stocklist[i * div:(i + 1) * div],
+                                                                      HS300_信号, df_gbbq, df_today, i,)))
+                else:
+                    pool_result.append(p.apply_async(run_multi, args=(stocklist[i * div:(i + 1) * div + mod],
+                                                                      HS300_信号, df_gbbq, df_today, i,)))
+            p.close()
+            p.join()
+            multi_results = []
+            # 读取pool的返回对象列表。i.get()是读取方法。拼接每个子进程返回的结果列表
+            for i in pool_result:
+                multi_results = multi_results + i.get()
+
+        # 按综合评分降序排序，输出每个股票匹配的子策略列表和综合评分
+        multi_results.sort(key=lambda x: x['score'], reverse=True)
+        df_result = pd.DataFrame(multi_results,
+                                 columns=['code', 'score', 'matched_strategies', 'logic_result', 'passed'])
+        df_result.to_csv('multi_result.csv', index=False, encoding='gbk')
+        print(f'多因子选股执行完毕 用时 {(time.time() - starttime_tick):>.2f} 秒 '
+              f'已选出 {len(multi_results)} 只股票（结果已保存 multi_result.csv）:')
+        for r in multi_results:
+            print(f"  {r['code']} 综合评分 {r['score']:.2f} 匹配子策略: {r['matched_strategies']}")
+        print(f'全部完成 共用时 {(time.time() - starttime):>.2f} 秒')
+        sys.exit(0)
 
     print(f'开始执行策略1(mode=fast)')
     starttime_tick = time.time()
