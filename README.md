@@ -222,6 +222,64 @@ celue_sell = 卖策略(df_stock)
 ```
 
 
+## 功能迭代（新增）
+
+在原有单策略选股、回测流程基础上，新增以下三项能力。所有新功能均通过启动参数控制，默认不影响原有流程。
+
+### 1. 多因子组合选股引擎（CeLue_engine.py）
+
+原系统只支持单策略选股。新增 `CeLue_engine.py` 组合引擎，在不修改 `CeLue.py` 策略函数的前提下，将各策略封装为“因子”，支持 AND / OR / NOT 任意逻辑组合与嵌套，并兼容原单策略模式。
+
+- 组合配置写在 `user_config.py` 的 `strategy_combo`，语法示例：
+
+```python
+strategy_combo = {
+    'op': 'AND',
+    'children': [
+        '策略1',                                  # 单因子
+        {'factor': '策略2', 'weight': 2.0},        # 带权重因子
+        {'op': 'NOT', 'child': '策略1_full'},      # NOT 组合
+    ],
+}
+```
+
+- 运行多因子组合选股（新增 `combo` 启动参数）：
+
+```bash
+python xuangu.py combo          # 多进程组合选股
+python xuangu.py combo single   # 单进程组合选股
+```
+
+- 输出每只股票命中的子策略列表和综合评分（0~1，命中因子权重占比），按评分从高到低排序。不带 `combo` 参数时，`xuangu.py` 仍执行原“策略1→策略2”串联单策略流程。
+
+### 2. 实时行情监控与预警（monitor.py）
+
+原系统只在运行 `xuangu.py` 时选股一次。新增 `monitor.py` 常驻监控模块：
+
+- 每 30 秒（可配置）从通达信获取一次实时行情，对监控列表中的股票持续运行组合买入策略与卖出策略；
+- 触发买入/卖出信号时，记录信号时间、价格、触发策略，写入预警日志（默认 `monitor_alert.log`）；
+- 监控在独立后台线程运行，不阻塞主进程，支持 启动/暂停/恢复/停止 控制。
+
+配置见 `user_config.py` 的 `monitor` 字典。启动示例：
+
+```bash
+python monitor.py                       # 交互式控制台（pause/resume/stop/status）
+python monitor.py interval=10 code=000001,600030   # 指定间隔与监控列表
+python monitor.py nointeractive         # 后台运行，Ctrl+C 停止
+python monitor.py once                  # 只跑一轮后退出（测试用）
+```
+
+### 3. 回测性能优化与结果持久化
+
+- `celue_save.py` 沿用多进程按股票区间并行计算策略信号，在生成 `celue汇总.csv` 的同时，将结果升级写入 SQLite 数据库 `celue汇总.db`（表 `celue_signal`，字段：股票代码、交易日期、买入/卖出信号、触发策略、前复权价格），并建立 `(code, date)` 索引。
+- `huice.py` 新增回测结果分析函数 `analyze_result`，输出**夏普比率、最大回撤、胜率**等统计指标。回测结束后自动打印；也可单独分析已有回测结果：
+
+```bash
+python huice.py analyze                        # 分析 rq_result 目录下最新结果
+python huice.py analyze rq_result/xxx.pkl      # 分析指定结果文件
+```
+
+
 ## 软件架构
 |                           软件/库                            |   版本   |
 | :----------------------------------------------------------: | :------: |
