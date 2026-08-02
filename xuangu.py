@@ -10,8 +10,10 @@ from multiprocessing import Pool, RLock, freeze_support
 from rich import print
 from tqdm import tqdm
 import CeLue  # 个人策略文件，不分享
+import CeLue_engine  # 多因子组合策略引擎
 import func
 import user_config as ucfg
+import cli_config  # 命令行配置覆盖
 
 # 配置部分
 
@@ -121,6 +123,45 @@ def run_celue2(stocklist, HS300_信号, df_gbbq, df_today, tqdm_position=None):
     return stocklist
 
 
+def run_combo(stocklist, HS300_信号, df_gbbq, df_today, tqdm_position=None):
+    """
+    多因子组合选股：用 CeLue_engine 按 user_config.strategy_combo 配置执行组合策略。
+    与 run_celue1/run_celue2 的“逐步剔除”不同，本函数直接对每只股票计算组合结果，
+    返回命中的股票及其“命中子策略列表 + 综合评分”，实现多因子组合选股。
+    """
+    engine = CeLue_engine.StrategyEngine(cli_config.get_strategy_combo())
+    if 'single' in sys.argv[1:]:
+        tq = tqdm(stocklist[:])
+    else:
+        tq = tqdm(stocklist[:], leave=False, position=tqdm_position)
+    result = []  # 元素为 (股票代码, 命中子策略列表, 综合评分)
+    for stockcode in tq:
+        tq.set_description(stockcode)
+        pklfile = csvdaypath + os.sep + stockcode + '.pkl'
+        df_stock = pd.read_pickle(pklfile)
+        # 盘中交易时段合并实时行情，逻辑与 run_celue2 保持一致
+        if df_today is not None and '09:00:00' < time.strftime("%H:%M:%S", time.localtime()) < '16:00:00' \
+                and 0 <= time.localtime(time.time()).tm_wday <= 4:
+            df_today_code = df_today.loc[df_today['code'] == stockcode]
+            df_stock = func.update_stockquote(stockcode, df_stock, df_today_code)
+            now_date = pd.to_datetime(time.strftime("%Y-%m-%d", time.localtime()))
+            if now_date in df_gbbq.loc[df_gbbq['code'] == stockcode]['权息日'].to_list():
+                cw_dict = func.readall_local_cwfile()
+                df_stock = func.make_fq(stockcode, df_stock, df_gbbq, cw_dict)
+        df_stock['date'] = pd.to_datetime(df_stock['date'], format='%Y-%m-%d')  # 转为时间格式
+        df_stock.set_index('date', drop=False, inplace=True)  # 时间为索引
+        # 组合引擎上下文，传入策略2所需的 HS300_信号 及日期区间
+        context = {'HS300_信号': HS300_信号, 'start_date': start_date, 'end_date': end_date}
+        try:
+            ret = engine.run(df_stock, context)
+        except Exception as e:
+            # 单只股票数据异常不影响整体流程
+            continue
+        if ret['matched']:
+            result.append((stockcode, ret['matched_factors'], ret['score']))
+    return result
+
+
 # 主程序开始
 if __name__ == '__main__':
     if 'single' in sys.argv[1:]:
@@ -177,6 +218,48 @@ if __name__ == '__main__':
         except FileNotFoundError:
             pass
         df_today = None
+
+    # combo 模式触发：位置开关 combo，或提供了 combo=<JSON> 覆盖参数
+    if 'combo' in sys.argv[1:] or any(a.startswith('combo=') for a in sys.argv[1:]):
+        # ============ 多因子组合选股模式 ============
+        # 由启动参数 combo 触发，按 user_config.strategy_combo 配置执行 AND/OR/NOT 组合选股，
+        # 输出每只股票命中的子策略列表和综合评分。原单策略串联模式不受影响。
+        print(f'检测到参数 combo, 执行多因子组合选股。组合配置: {cli_config.get_strategy_combo()}')
+        starttime_tick = time.time()
+        if 'single' in sys.argv[1:]:
+            combo_result = run_combo(stocklist, HS300_信号, df_gbbq, df_today)
+        else:
+            if os.cpu_count() > 8:
+                t_num = int(os.cpu_count() / 1.5)
+            else:
+                t_num = os.cpu_count() - 2
+            freeze_support()  # for Windows support
+            tqdm.set_lock(RLock())  # for managing output contention
+            p = Pool(processes=t_num, initializer=tqdm.set_lock, initargs=(tqdm.get_lock(),))
+            pool_result = []  # 存放pool池的返回对象列表
+            for i in range(0, t_num):
+                div = int(len(stocklist) / t_num)
+                mod = len(stocklist) % t_num
+                if i + 1 != t_num:
+                    pool_result.append(p.apply_async(
+                        run_combo, args=(stocklist[i * div:(i + 1) * div], HS300_信号, df_gbbq, df_today, i,)))
+                else:
+                    pool_result.append(p.apply_async(
+                        run_combo, args=(stocklist[i * div:(i + 1) * div + mod], HS300_信号, df_gbbq, df_today, i,)))
+            p.close()
+            p.join()
+            combo_result = []
+            for i in pool_result:
+                combo_result = combo_result + i.get()
+
+        # 按综合评分从高到低排序输出
+        combo_result.sort(key=lambda x: x[2], reverse=True)
+        print(f'多因子组合选股完毕，已选出 {len(combo_result):>d} 只股票 用时 {(time.time() - starttime_tick):>.2f} 秒')
+        print(f'全部完成 共用时 {(time.time() - starttime):>.2f} 秒 组合选股结果(股票代码 | 命中子策略 | 综合评分):')
+        for stockcode, factors, score in combo_result:
+            print(f'  {stockcode}  命中: {factors}  综合评分: {score}')
+        已选出股票列表 = [i[0] for i in combo_result]  # 与原变量对接，供买入下单使用
+        sys.exit(0)
 
     print(f'开始执行策略1(mode=fast)')
     starttime_tick = time.time()

@@ -1,12 +1,15 @@
 import os
+import sys
 import copy
 import time
 import pickle
+import sqlite3  # 从 SQLite 读取策略信号，与 celue_save.py 形成闭环
 import talib
 import pandas as pd
 import numpy as np
 
 import user_config as ucfg
+import cli_config  # 命令行配置覆盖
 from rqalpha.apis import *
 from rqalpha import run_func
 from tqdm import tqdm
@@ -43,8 +46,28 @@ def init(context):
     context.target_value = xiadan_target_value  # 设定具体股票总买入市值
     context.order_type = order_type  # 下单模式
 
-    df_celue = pd.read_csv(ucfg.tdx['csv_gbbq'] + os.sep + 'celue汇总.csv',
-                           index_col=0, encoding='gbk', dtype={'code': str})
+    # 优先从 SQLite 数据库读取策略信号（与 celue_save.py 形成闭环）；
+    # 数据库不存在时回退到旧的 celue汇总.csv，保证向后兼容。
+    db_path = cli_config.get_db_path()
+    if os.path.exists(db_path):
+        rprint(f'从 SQLite 读取策略信号: {db_path}')
+        conn = sqlite3.connect(db_path)
+        try:
+            df_celue = pd.read_sql('SELECT * FROM celue_signal', conn)
+        finally:
+            conn.close()
+        # 股票代码统一为 str（数据库可能存为数字），保留前导零
+        df_celue['code'] = df_celue['code'].astype(str).str.zfill(6)
+        # 数据库里 前复权价格 存为 close 的语义，celue_buy/celue_sell 存为 0/1，需还原为回测所需列
+        if '前复权价格' in df_celue.columns:
+            df_celue = df_celue.rename(columns={'前复权价格': 'close'})
+        df_celue['celue_buy'] = df_celue['celue_buy'].astype(bool)
+        df_celue['celue_sell'] = df_celue['celue_sell'].astype(bool)
+    else:
+        rprint(f'未找到数据库 {db_path}，回退读取 celue汇总.csv')
+        df_celue = pd.read_csv(ucfg.tdx['csv_gbbq'] + os.sep + 'celue汇总.csv',
+                               index_col=0, encoding='gbk', dtype={'code': str})
+
     df_celue['code'] = df_celue['code'].apply(lambda x: update_stockcode(x))  # 升级股票代码，匹配rqalpha
     df_celue['date'] = pd.to_datetime(df_celue['date'], format='%Y-%m-%d')  # 转为时间格式
     df_celue.set_index('date', drop=False, inplace=True)  # 时间为索引
@@ -219,6 +242,113 @@ __config__ = {
 
 start_time = f'程序开始时间：{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}'
 
+
+def analyze_result(result_dict, risk_free_rate=0.0):
+    """
+    回测结果分析：基于 rqalpha 输出的 result_dict 计算统计指标。
+
+    输出指标：
+      * 夏普比率 sharpe：年化超额收益 / 年化波动率（按日频，年化系数 252）
+      * 最大回撤 max_drawdown：账户净值从峰值回落的最大幅度
+      * 胜率 win_rate：盈利交易笔数 / 总平仓交易笔数
+
+    :param result_dict: rqalpha sys_analyser 输出的 dict
+    :param risk_free_rate: 无风险年化收益率，默认 0
+    :return: dict 统计指标
+    """
+    stats = {}
+
+    # ---- 取账户净值序列，兼容不同键名 ----
+    portfolios = None
+    for key in ('total_portfolios', 'stock_portfolios', 'portfolio'):
+        if key in result_dict and result_dict[key] is not None and len(result_dict[key]) > 0:
+            portfolios = result_dict[key]
+            break
+
+    if portfolios is not None:
+        # 优先使用单位净值，其次总市值
+        if 'unit_net_value' in portfolios.columns:
+            nav = portfolios['unit_net_value'].astype(float)
+        elif 'total_value' in portfolios.columns:
+            nav = portfolios['total_value'].astype(float)
+        else:
+            nav = portfolios.iloc[:, 0].astype(float)
+
+        # 日收益率
+        daily_returns = nav.pct_change().dropna()
+
+        # 夏普比率（年化）
+        if daily_returns.std() != 0 and len(daily_returns) > 1:
+            excess = daily_returns.mean() - risk_free_rate / 252
+            sharpe = excess / daily_returns.std() * np.sqrt(252)
+        else:
+            sharpe = float('nan')
+        stats['sharpe'] = round(float(sharpe), 4)
+
+        # 最大回撤：净值累计最高点回落
+        running_max = nav.cummax()
+        drawdown = nav / running_max - 1
+        stats['max_drawdown'] = round(float(drawdown.min()), 4)
+    else:
+        stats['sharpe'] = float('nan')
+        stats['max_drawdown'] = float('nan')
+
+    # ---- 胜率：优先用合并的“盈亏率”，否则用交割单盈亏 ----
+    trades = result_dict.get('trades')
+    win_rate = float('nan')
+    total_trades = 0
+    win_trades = 0
+    if trades is not None and len(trades) > 0:
+        if '盈亏率' in trades.columns:
+            pnl = pd.to_numeric(trades['盈亏率'], errors='coerce').dropna()
+            total_trades = len(pnl)
+            win_trades = int((pnl > 0).sum())
+        elif '盈亏金额' in trades.columns:
+            pnl = pd.to_numeric(trades['盈亏金额'], errors='coerce').dropna()
+            total_trades = len(pnl)
+            win_trades = int((pnl > 0).sum())
+        if total_trades > 0:
+            win_rate = win_trades / total_trades
+    stats['win_rate'] = round(float(win_rate), 4) if total_trades > 0 else float('nan')
+    stats['total_trades'] = total_trades
+    stats['win_trades'] = win_trades
+    return stats
+
+
+def print_analysis(result_dict):
+    """打印回测统计分析结果"""
+    stats = analyze_result(result_dict)
+    rprint('[bold]===== 回测结果分析 =====[/bold]')
+    # 夏普比率
+    sharpe_str = f"{stats['sharpe']}" if stats['sharpe'] == stats['sharpe'] else 'N/A'
+    rprint(f"夏普比率 {sharpe_str}")
+    # 最大回撤
+    md_str = f"{stats['max_drawdown']:.2%}" if stats['max_drawdown'] == stats['max_drawdown'] else 'N/A'
+    rprint(f"最大回撤 {md_str}")
+    # 胜率
+    wr_str = f"{stats['win_rate']:.2%}" if stats['win_rate'] == stats['win_rate'] else 'N/A'
+    rprint(f"胜率 {wr_str}（盈利 {stats['win_trades']} / 总平仓 {stats['total_trades']} 笔）")
+    return stats
+
+
+# 启动参数 analyze：只分析已有回测结果，不重新跑回测。
+# 用法：python huice.py analyze [结果pkl文件路径]
+# 不指定路径时，取 rq_result 目录下最新的 .pkl 文件。
+if 'analyze' in sys.argv[1:]:
+    args = [a for a in sys.argv[1:] if a != 'analyze']
+    if args:
+        pkl_file = args[0]
+    else:
+        pkls = [os.path.join('rq_result', f) for f in os.listdir('rq_result') if f.endswith('.pkl')]
+        if not pkls:
+            rprint('[red]rq_result 目录下没有找到回测结果 pkl 文件[/red]')
+            sys.exit(1)
+        pkl_file = max(pkls, key=os.path.getmtime)
+    rprint(f'分析回测结果文件: {pkl_file}')
+    result_dict = pd.read_pickle(pkl_file)
+    print_analysis(result_dict)
+    sys.exit(0)
+
 # 使用 run_func 函数来运行策略
 # 此种模式下，您只需要在当前环境下定义策略函数，并传入指定运行的函数，即可运行策略。
 # 如果你的函数命名是按照 API 规范来，则可以直接按照以下方式来运行
@@ -268,3 +398,6 @@ rprint(
     f"\t基准收益 {result_dict['summary']['benchmark_total_returns']:>.2%}\t基准年化 {result_dict['summary']['benchmark_annualized_returns']:>.2%}"
     f"\t最大回撤 {result_dict['summary']['max_drawdown']:>.2%}"
     f"\n打开程序文件夹下的rq_result.png查看收益走势图")
+
+# 回测结果分析：输出夏普比率、最大回撤、胜率等统计指标
+print_analysis(result_dict)

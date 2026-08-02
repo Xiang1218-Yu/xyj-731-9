@@ -5,6 +5,7 @@
 import os
 import sys
 import time
+import sqlite3  # 回测结果持久化：升级为 SQLite 数据库存储
 from multiprocessing import Pool, RLock, freeze_support
 import numpy as np
 import pandas as pd
@@ -14,6 +15,7 @@ from rich import print
 import CeLue  # 个人策略文件，不分享
 import func
 import user_config as ucfg
+import cli_config  # 命令行配置覆盖
 
 # 变量定义
 要剔除的通达信概念 = ["ST板块", ]  # list类型。通达信软件中查看“概念板块”。
@@ -46,7 +48,7 @@ def celue_save(file_list, HS300_信号, tqdm_position=None):
             if 'celue_sell' in df.columns:
                 del df['celue_sell']
         df.set_index('date', drop=False, inplace=True)  # 时间为索引。方便与另外复权的DF表对齐合并
-        if not {'celue_buy', 'celue_buy'}.issubset(df.columns):
+        if not {'celue_buy', 'celue_sell'}.issubset(df.columns):
             df.insert(df.shape[1], 'celue_buy', np.nan)  # 插入celue_buy列，赋值NaN
             df.insert(df.shape[1], 'celue_sell', np.nan)  # 插入celue_sell列，赋值NaN
         else:
@@ -83,6 +85,56 @@ def celue_save(file_list, HS300_信号, tqdm_position=None):
     df_celue.set_index('date', drop=False, inplace=True)  # 时间为索引。方便与另外复权的DF表对齐合并
 
     return df_celue
+
+
+def 触发策略(row):
+    """
+    根据买卖信号推断触发的策略名称，写入 SQLite 的“触发策略”字段。
+    当前策略体系中买点由 策略2 产生，卖点由 卖策略 产生。
+    """
+    tags = []
+    if bool(row.get('celue_buy')):
+        tags.append('策略2')
+    if bool(row.get('celue_sell')):
+        tags.append('卖策略')
+    return ','.join(tags)
+
+
+def save_to_sqlite(df_celue, db_path):
+    """
+    将策略信号汇总结果写入 SQLite 数据库（升级自 CSV 存储）。
+
+    表 celue_signal 字段：
+      code        股票代码
+      date        交易日期
+      celue_buy   买入信号(1/0)
+      celue_sell  卖出信号(1/0)
+      触发策略     触发的策略名称
+      close       前复权收盘价（celue汇总里的 close 即前复权价格）
+    """
+    df = df_celue.copy()
+    # 前复权价格：celue汇总中的 close 列即为前复权价（数据在 make_fq 阶段已前复权）
+    if 'close' not in df.columns:
+        df['close'] = np.nan
+    # 布尔转 0/1，便于数据库存储与查询
+    df['celue_buy'] = df['celue_buy'].fillna(False).astype(bool).astype(int)
+    df['celue_sell'] = df['celue_sell'].fillna(False).astype(bool).astype(int)
+    df['触发策略'] = df.apply(触发策略, axis=1)
+    df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
+
+    out = df[['code', 'date', 'celue_buy', 'celue_sell', '触发策略', 'close']].rename(
+        columns={'close': '前复权价格'})
+
+    conn = sqlite3.connect(db_path)
+    try:
+        # 整表重建，保证与本轮信号一致
+        out.to_sql('celue_signal', conn, if_exists='replace', index=False)
+        # 建立常用查询索引
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_code_date ON celue_signal(code, date)')
+        conn.commit()
+    finally:
+        conn.close()
+    return len(out)
 
 
 if __name__ == '__main__':
@@ -199,4 +251,10 @@ if __name__ == '__main__':
                 .reset_index(drop=True)
                 )
     df_celue.to_csv(ucfg.tdx['csv_gbbq'] + os.sep + 'celue汇总.csv', index=True, encoding='gbk')
+
+    # 升级持久化：同时写入 SQLite 数据库，供 huice.py 回测分析使用
+    # 数据库路径支持命令行 db=<path> 覆盖（默认 user_config.celue_db）
+    db_path = cli_config.get_db_path()
+    n = save_to_sqlite(df_celue, db_path)
+    print(f'已写入 SQLite 数据库 {db_path}，共 {n} 条信号记录')
     print(f'用时 {(time.time() - starttime):.2f} 秒, 全部处理完成，程序退出')

@@ -28,4 +28,22 @@ index_list = [  # 通达信需要转换的指数文件。通达信按998查看�
     'sz399001.day',  # 深成指
 ]
 
+# 多因子选股组合配置（供 xuangu.py 的多因子模式 与 monitor.py 使用）
+# 语法见 CeLue_engine.build_node：字符串=单因子；{'op':'AND/OR/NOT', ...}=逻辑组合。
+# 默认等价于原“策略1 AND 策略2”串联逻辑，保证向后兼容。
+strategy_combo = {
+    'op': 'AND',
+    'children': ['策略1', '策略2'],
+}
+
+# 实时监控模块 monitor.py 配置
+monitor = {
+    'interval': 30,                 # 行情轮询间隔（秒）
+    'watchlist': [],                # 监控股票列表，空则监控 csv_lday 目录全部股票
+    'log_file': 'monitor_alert.log',  # 预警日志文件
+}
+
+# 策略信号 SQLite 数据库路径（celue_save.py 写入，huice.py 读取，形成闭环）
+celue_db = tdx['csv_gbbq'] + '/celue汇总.db'
+
 # 配置部分结束
