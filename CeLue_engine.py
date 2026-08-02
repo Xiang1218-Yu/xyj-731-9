@@ -149,7 +149,11 @@ class NotNode(Node):
 
     def evaluate(self, df, context):
         sig, factors = self.child.evaluate(df, context)
-        return ~sig, factors
+        # 同步对子节点的因子信号取反：NOT 之后，因子的“有效贡献”应为其取反结果。
+        # 否则被 NOT 排除的因子仍会被记为命中，导致 matched_factors 和 score 与
+        # 组合结果不一致（例如 NOT 命中时 matched=False 却 score=1.0）。
+        negated_factors = {name: ~s for name, s in factors.items()}
+        return ~sig, negated_factors
 
 
 # ---------------------------------------------------------------------------
