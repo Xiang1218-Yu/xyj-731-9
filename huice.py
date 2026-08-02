@@ -3,11 +3,13 @@ import sys
 import copy
 import time
 import pickle
+import sqlite3  # 从 SQLite 读取策略信号，与 celue_save.py 形成闭环
 import talib
 import pandas as pd
 import numpy as np
 
 import user_config as ucfg
+import cli_config  # 命令行配置覆盖
 from rqalpha.apis import *
 from rqalpha import run_func
 from tqdm import tqdm
@@ -44,8 +46,28 @@ def init(context):
     context.target_value = xiadan_target_value  # 设定具体股票总买入市值
     context.order_type = order_type  # 下单模式
 
-    df_celue = pd.read_csv(ucfg.tdx['csv_gbbq'] + os.sep + 'celue汇总.csv',
-                           index_col=0, encoding='gbk', dtype={'code': str})
+    # 优先从 SQLite 数据库读取策略信号（与 celue_save.py 形成闭环）；
+    # 数据库不存在时回退到旧的 celue汇总.csv，保证向后兼容。
+    db_path = cli_config.get_db_path()
+    if os.path.exists(db_path):
+        rprint(f'从 SQLite 读取策略信号: {db_path}')
+        conn = sqlite3.connect(db_path)
+        try:
+            df_celue = pd.read_sql('SELECT * FROM celue_signal', conn)
+        finally:
+            conn.close()
+        # 股票代码统一为 str（数据库可能存为数字），保留前导零
+        df_celue['code'] = df_celue['code'].astype(str).str.zfill(6)
+        # 数据库里 前复权价格 存为 close 的语义，celue_buy/celue_sell 存为 0/1，需还原为回测所需列
+        if '前复权价格' in df_celue.columns:
+            df_celue = df_celue.rename(columns={'前复权价格': 'close'})
+        df_celue['celue_buy'] = df_celue['celue_buy'].astype(bool)
+        df_celue['celue_sell'] = df_celue['celue_sell'].astype(bool)
+    else:
+        rprint(f'未找到数据库 {db_path}，回退读取 celue汇总.csv')
+        df_celue = pd.read_csv(ucfg.tdx['csv_gbbq'] + os.sep + 'celue汇总.csv',
+                               index_col=0, encoding='gbk', dtype={'code': str})
+
     df_celue['code'] = df_celue['code'].apply(lambda x: update_stockcode(x))  # 升级股票代码，匹配rqalpha
     df_celue['date'] = pd.to_datetime(df_celue['date'], format='%Y-%m-%d')  # 转为时间格式
     df_celue.set_index('date', drop=False, inplace=True)  # 时间为索引

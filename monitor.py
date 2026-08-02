@@ -19,10 +19,13 @@
 * 命令行运行时提供交互式控制台，也可作为库被其他程序 import 后编程控制。
 
 启动参数（python monitor.py [参数...]）：
-    once                 只跑一轮就退出（便于测试，不进入循环）
-    interval=<秒>         覆盖轮询间隔，如 interval=10
-    code=<代码,代码...>   指定监控股票列表，如 code=000001,600030
-    nointeractive        非交互模式，后台线程运行直到 Ctrl+C
+    once                       只跑一轮就退出（便于测试，不进入循环）
+    nointeractive              非交互模式，后台线程运行直到 Ctrl+C
+    interval=<秒>              覆盖轮询间隔，如 interval=10
+    watchlist=<代码,代码...>   指定监控股票列表，如 watchlist=000001,600030
+    logfile=<路径>            覆盖预警日志文件
+    combo=<JSON>              覆盖多因子组合配置（见 cli_config）
+以上 key=value 覆盖参数由 cli_config 统一解析。
 
 作者：功能迭代新增，命名与项目现有风格保持一致。
 """
@@ -38,6 +41,7 @@ import CeLue  # 个人策略文件，不分享。卖出信号复用 CeLue.卖策
 import CeLue_engine  # 多因子组合引擎，用于买入信号
 import func
 import user_config as ucfg
+import cli_config  # 命令行配置覆盖
 
 
 def _build_logger(log_file):
@@ -86,16 +90,22 @@ class StockMonitor:
         self._pause_event = threading.Event()  # 置位表示暂停
         self._running = False
 
-        # 组合买入引擎
-        self.engine = CeLue_engine.StrategyEngine(ucfg.strategy_combo)
+        # 组合买入引擎（组合配置支持命令行 combo=<JSON> 覆盖）
+        self.engine = CeLue_engine.StrategyEngine(cli_config.get_strategy_combo())
 
         # 预加载 HS300 信号与 gbbq，供策略使用
         self.HS300_信号 = self._load_hs300_signal()
         try:
             self.df_gbbq = pd.read_csv(ucfg.tdx['csv_gbbq'] + '/gbbq.csv',
                                        encoding='gbk', dtype={'code': str})
+            # 权息日转为时间格式，供盘中前复权判断使用（对齐 xuangu.py 逻辑）
+            if '权息日' in self.df_gbbq.columns:
+                self.df_gbbq['权息日'] = pd.to_datetime(self.df_gbbq['权息日'], errors='coerce')
         except FileNotFoundError:
             self.df_gbbq = pd.DataFrame(columns=['code', '权息日'])
+
+        # 财报数据字典延迟加载（仅在需要重新前复权时载入，避免启动即占用大量内存）
+        self._cw_dict = None
 
         # 记录每只股票上一次的信号，避免同一信号在多轮内重复预警刷屏
         self._last_signal = {}
@@ -128,6 +138,13 @@ class StockMonitor:
                 if 'code' in df_today.columns else df_today
             if len(df_today_code):
                 df_stock = func.update_stockquote(stockcode, df_stock, df_today_code)
+                # 权息日复权：若今天处于该股权息日内，需重新前复权，
+                # 否则盘中计算结果会与 xuangu.py 选股不一致（对齐 run_celue2/run_combo 逻辑）
+                now_date = pd.to_datetime(time.strftime("%Y-%m-%d", time.localtime()))
+                if now_date in self.df_gbbq.loc[self.df_gbbq['code'] == stockcode]['权息日'].to_list():
+                    if self._cw_dict is None:  # 延迟加载财报数据，仅首次需要时载入
+                        self._cw_dict = func.readall_local_cwfile()
+                    df_stock = func.make_fq(stockcode, df_stock, self.df_gbbq, self._cw_dict)
         df_stock['date'] = pd.to_datetime(df_stock['date'], format='%Y-%m-%d')
         df_stock.set_index('date', drop=False, inplace=True)
 
@@ -245,26 +262,15 @@ class StockMonitor:
         self._run_once()
 
 
-def _parse_args(argv):
-    """解析启动参数，返回 (watchlist, interval, once, interactive)"""
-    watchlist = None
-    interval = None
+def main():
+    argv = sys.argv[1:]
     once = 'once' in argv
     interactive = 'nointeractive' not in argv
-    for arg in argv:
-        if arg.startswith('interval='):
-            try:
-                interval = int(arg.split('=', 1)[1])
-            except ValueError:
-                pass
-        elif arg.startswith('code='):
-            watchlist = [c for c in arg.split('=', 1)[1].split(',') if c]
-    return watchlist, interval, once, interactive
-
-
-def main():
-    watchlist, interval, once, interactive = _parse_args(sys.argv[1:])
-    monitor = StockMonitor(watchlist=watchlist, interval=interval)
+    # 监控配置(interval/watchlist/log_file)统一通过 cli_config 从命令行覆盖 user_config.monitor
+    mon_cfg = cli_config.get_monitor_config(argv)
+    monitor = StockMonitor(watchlist=mon_cfg.get('watchlist') or None,
+                           interval=mon_cfg.get('interval'),
+                           log_file=mon_cfg.get('log_file'))
 
     if once:
         # 单轮同步执行，便于测试

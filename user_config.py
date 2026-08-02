@@ -43,4 +43,7 @@ monitor = {
     'log_file': 'monitor_alert.log',  # 预警日志文件
 }
 
+# 策略信号 SQLite 数据库路径（celue_save.py 写入，huice.py 读取，形成闭环）
+celue_db = tdx['csv_gbbq'] + '/celue汇总.db'
+
 # 配置部分结束

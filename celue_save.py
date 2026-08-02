@@ -15,6 +15,7 @@ from rich import print
 import CeLue  # 个人策略文件，不分享
 import func
 import user_config as ucfg
+import cli_config  # 命令行配置覆盖
 
 # 变量定义
 要剔除的通达信概念 = ["ST板块", ]  # list类型。通达信软件中查看“概念板块”。
@@ -47,7 +48,7 @@ def celue_save(file_list, HS300_信号, tqdm_position=None):
             if 'celue_sell' in df.columns:
                 del df['celue_sell']
         df.set_index('date', drop=False, inplace=True)  # 时间为索引。方便与另外复权的DF表对齐合并
-        if not {'celue_buy', 'celue_buy'}.issubset(df.columns):
+        if not {'celue_buy', 'celue_sell'}.issubset(df.columns):
             df.insert(df.shape[1], 'celue_buy', np.nan)  # 插入celue_buy列，赋值NaN
             df.insert(df.shape[1], 'celue_sell', np.nan)  # 插入celue_sell列，赋值NaN
         else:
@@ -252,7 +253,8 @@ if __name__ == '__main__':
     df_celue.to_csv(ucfg.tdx['csv_gbbq'] + os.sep + 'celue汇总.csv', index=True, encoding='gbk')
 
     # 升级持久化：同时写入 SQLite 数据库，供 huice.py 回测分析使用
-    db_path = ucfg.tdx['csv_gbbq'] + os.sep + 'celue汇总.db'
+    # 数据库路径支持命令行 db=<path> 覆盖（默认 user_config.celue_db）
+    db_path = cli_config.get_db_path()
     n = save_to_sqlite(df_celue, db_path)
     print(f'已写入 SQLite 数据库 {db_path}，共 {n} 条信号记录')
     print(f'用时 {(time.time() - starttime):.2f} 秒, 全部处理完成，程序退出')

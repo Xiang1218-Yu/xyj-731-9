@@ -13,6 +13,7 @@ import CeLue  # 个人策略文件，不分享
 import CeLue_engine  # 多因子组合策略引擎
 import func
 import user_config as ucfg
+import cli_config  # 命令行配置覆盖
 
 # 配置部分
 
@@ -128,7 +129,7 @@ def run_combo(stocklist, HS300_信号, df_gbbq, df_today, tqdm_position=None):
     与 run_celue1/run_celue2 的“逐步剔除”不同，本函数直接对每只股票计算组合结果，
     返回命中的股票及其“命中子策略列表 + 综合评分”，实现多因子组合选股。
     """
-    engine = CeLue_engine.StrategyEngine(ucfg.strategy_combo)
+    engine = CeLue_engine.StrategyEngine(cli_config.get_strategy_combo())
     if 'single' in sys.argv[1:]:
         tq = tqdm(stocklist[:])
     else:
@@ -218,11 +219,12 @@ if __name__ == '__main__':
             pass
         df_today = None
 
-    if 'combo' in sys.argv[1:]:
+    # combo 模式触发：位置开关 combo，或提供了 combo=<JSON> 覆盖参数
+    if 'combo' in sys.argv[1:] or any(a.startswith('combo=') for a in sys.argv[1:]):
         # ============ 多因子组合选股模式 ============
         # 由启动参数 combo 触发，按 user_config.strategy_combo 配置执行 AND/OR/NOT 组合选股，
         # 输出每只股票命中的子策略列表和综合评分。原单策略串联模式不受影响。
-        print(f'检测到参数 combo, 执行多因子组合选股。组合配置: {ucfg.strategy_combo}')
+        print(f'检测到参数 combo, 执行多因子组合选股。组合配置: {cli_config.get_strategy_combo()}')
         starttime_tick = time.time()
         if 'single' in sys.argv[1:]:
             combo_result = run_combo(stocklist, HS300_信号, df_gbbq, df_today)

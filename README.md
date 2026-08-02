@@ -271,12 +271,34 @@ python monitor.py once                  # 只跑一轮后退出（测试用）
 
 ### 3. 回测性能优化与结果持久化
 
-- `celue_save.py` 沿用多进程按股票区间并行计算策略信号，在生成 `celue汇总.csv` 的同时，将结果升级写入 SQLite 数据库 `celue汇总.db`（表 `celue_signal`，字段：股票代码、交易日期、买入/卖出信号、触发策略、前复权价格），并建立 `(code, date)` 索引。
+- `celue_save.py` 沿用多进程按股票区间并行计算策略信号，在生成 `celue汇总.csv` 的同时，将结果升级写入 SQLite 数据库（默认 `user_config.celue_db`，表 `celue_signal`，字段：股票代码、交易日期、买入/卖出信号、触发策略、前复权价格），并建立 `(code, date)` 索引。
+- `huice.py` 回测**优先从 SQLite 数据库读取策略信号**（与 `celue_save.py` 形成闭环），数据库不存在时自动回退读取 `celue汇总.csv`，向后兼容。
 - `huice.py` 新增回测结果分析函数 `analyze_result`，输出**夏普比率、最大回撤、胜率**等统计指标。回测结束后自动打印；也可单独分析已有回测结果：
 
 ```bash
 python huice.py analyze                        # 分析 rq_result 目录下最新结果
 python huice.py analyze rq_result/xxx.pkl      # 分析指定结果文件
+```
+
+### 4. 命令行配置覆盖（cli_config.py）
+
+新增 `cli_config.py`，各脚本的关键配置均可用启动参数（`key=value` 形式）临时覆盖 `user_config.py`，无需改配置文件：
+
+| 参数 | 作用 | 适用脚本 |
+| :--- | :--- | :--- |
+| `combo=<JSON>` | 覆盖多因子组合配置 `strategy_combo` | xuangu.py / monitor.py |
+| `db=<路径>` | 覆盖策略信号数据库路径 `celue_db` | celue_save.py / huice.py |
+| `interval=<秒>` | 覆盖监控轮询间隔 | monitor.py |
+| `watchlist=<代码,代码>` | 覆盖监控股票列表 | monitor.py |
+| `logfile=<路径>` | 覆盖预警日志文件 | monitor.py |
+
+示例：
+
+```bash
+python xuangu.py 'combo={"op":"OR","children":["策略1","策略2"]}'   # 用 OR 组合选股
+python celue_save.py db=/data/my_signal.db                          # 信号写入指定数据库
+python huice.py db=/data/my_signal.db analyze                       # 从指定数据库回测/分析
+python monitor.py interval=10 watchlist=000001,600030 logfile=a.log # 覆盖监控参数
 ```
 
 
