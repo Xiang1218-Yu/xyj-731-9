@@ -1,9 +1,16 @@
 """
 选股多线程版本文件。导入数据——执行策略——显示结果
 为保证和通达信选股一致，需使用前复权数据
+
+命令行参数：
+  single              单进程执行（默认多进程）
+  --multi <file>      使用多因子策略引擎，从 JSON 配置文件加载策略组合
+                      配置格式见 strategy_engine.py 的 build_engine_from_config 说明
+  --score             多因子模式下，按综合评分排序输出（默认按股票代码排序）
 """
 import os
 import sys
+import json
 import time
 import pandas as pd
 from multiprocessing import Pool, RLock, freeze_support
@@ -12,6 +19,7 @@ from tqdm import tqdm
 import CeLue  # 个人策略文件，不分享
 import func
 import user_config as ucfg
+import strategy_engine
 
 # 配置部分
 
@@ -121,9 +129,85 @@ def run_celue2(stocklist, HS300_信号, df_gbbq, df_today, tqdm_position=None):
     return stocklist
 
 
+# 多进程 worker 的全局引擎变量，通过 initializer 在每个子进程启动时构建一次，避免重复构建
+_worker_engine = None
+_worker_engine_config = None
+
+
+def _init_worker(engine_config, lock):
+    """进程池初始化函数：在每个子进程启动时构建一次策略引擎并复用"""
+    global _worker_engine, _worker_engine_config
+    tqdm.set_lock(lock)
+    _worker_engine_config = engine_config
+    if engine_config is not None:
+        _worker_engine = strategy_engine.build_engine_from_config(engine_config)
+
+
+def run_multi_factor_worker(stocklist, HS300_信号, df_gbbq, df_today,
+                            start_date='', end_date='', tqdm_position=None):
+    """
+    多因子策略引擎工作函数，可在多进程中调用。
+    引擎实例由 _init_worker 在进程启动时构建一次，通过全局变量复用，避免每只股票重复构建。
+    返回 {stockcode: StrategyResult} 字典。
+    """
+    global _worker_engine
+    if _worker_engine is None:
+        # 单进程模式下 initializer 未执行，在此兜底构建
+        _worker_engine = strategy_engine.build_engine_from_config(_worker_engine_config)
+
+    results = {}
+    tq = tqdm(stocklist[:], leave=False, position=tqdm_position)
+    for stockcode in tq:
+        tq.set_description(stockcode)
+        pklfile = csvdaypath + os.sep + stockcode + '.pkl'
+        try:
+            df_stock = pd.read_pickle(pklfile)
+        except FileNotFoundError:
+            continue
+        if df_today is not None:
+            df_stock = func.update_stockquote(stockcode, df_stock, df_today)
+        df_stock['date'] = pd.to_datetime(df_stock['date'], format='%Y-%m-%d')
+        df_stock.set_index('date', drop=False, inplace=True)
+        context = {
+            'start_date': start_date,
+            'end_date': end_date,
+        }
+        if HS300_信号 is not None:
+            context['HS300_信号'] = HS300_信号
+        if df_gbbq is not None:
+            context['df_gbbq'] = df_gbbq
+        result = _worker_engine.evaluate(df_stock, **context)
+        if result.matched:
+            results[stockcode] = result
+    return results
+
+
 # 主程序开始
 if __name__ == '__main__':
-    if 'single' in sys.argv[1:]:
+    # 解析命令行参数
+    multi_config_path = None
+    sort_by_score = False
+    argv = sys.argv[1:]
+    i = 0
+    while i < len(argv):
+        if argv[i] == '--multi' and i + 1 < len(argv):
+            multi_config_path = argv[i + 1]
+            i += 2
+            continue
+        elif argv[i] == '--score':
+            sort_by_score = True
+        i += 1
+
+    use_multi_factor = multi_config_path is not None
+
+    if use_multi_factor:
+        print(f'[bold blue]多因子策略引擎模式[/bold blue]，配置文件: {multi_config_path}')
+        if not os.path.exists(multi_config_path):
+            print(f'[red]错误：配置文件 {multi_config_path} 不存在[/red]')
+            sys.exit(1)
+        with open(multi_config_path, 'r', encoding='utf-8') as f:
+            engine_config = json.load(f)
+    elif 'single' in sys.argv[1:]:
         print(f'检测到参数 single, 单进程执行')
     else:
         print(f'附带命令行参数 single 单进程执行(默认多进程)')
@@ -178,78 +262,135 @@ if __name__ == '__main__':
             pass
         df_today = None
 
-    print(f'开始执行策略1(mode=fast)')
-    starttime_tick = time.time()
-    if 'single' in sys.argv[1:]:
-        stocklist = run_celue1(stocklist, df_today)
+    # ====== 策略执行分支 ======
+    if use_multi_factor:
+        # 多因子策略引擎模式
+        print(f'开始执行多因子策略引擎')
+        starttime_tick = time.time()
+        multi_results = {}
+
+        if 'single' in sys.argv[1:]:
+            # 单进程模式：设置全局配置后直接调用，worker 内部兜底构建一次引擎
+            _worker_engine_config = engine_config
+            multi_results = run_multi_factor_worker(
+                stocklist, HS300_信号, df_gbbq, df_today,
+                start_date=start_date, end_date=end_date,
+            )
+        else:
+            # 多进程并行执行：通过 initializer 在每个子进程启动时构建一次引擎并复用
+            if os.cpu_count() > 8:
+                t_num = int(os.cpu_count() / 1.5)
+            else:
+                t_num = os.cpu_count() - 2
+            freeze_support()
+            tqdm.set_lock(RLock())
+            # initializer 在每个子进程启动时执行一次，构建引擎实例并设置 tqdm 锁
+            p = Pool(processes=t_num, initializer=_init_worker,
+                    initargs=(engine_config, tqdm.get_lock()))
+            pool_result = []
+            for i in range(0, t_num):
+                div = int(len(stocklist) / t_num)
+                mod = len(stocklist) % t_num
+                if i + 1 != t_num:
+                    pool_result.append(p.apply_async(
+                        run_multi_factor_worker,
+                        args=(stocklist[i * div:(i + 1) * div],
+                              HS300_信号, df_gbbq, df_today, start_date, end_date, i)))
+                else:
+                    pool_result.append(p.apply_async(
+                        run_multi_factor_worker,
+                        args=(stocklist[i * div:(i + 1) * div + mod],
+                              HS300_信号, df_gbbq, df_today, start_date, end_date, i)))
+            p.close()
+            p.join()
+            for pr in pool_result:
+                multi_results.update(pr.get())
+
+        print(f'多因子策略执行完毕，已选出 {len(multi_results)} 只股票 '
+              f'用时 {(time.time() - starttime_tick):.2f} 秒')
+
+        # 输出结果：股票代码、匹配子策略列表、综合评分
+        result_rows = []
+        for code, res in multi_results.items():
+            result_rows.append({
+                'code': code,
+                'matched_strategies': ','.join(res.matched_strategies),
+                'score': round(res.score, 3),
+            })
+        df_result = pd.DataFrame(result_rows)
+        if len(df_result) > 0:
+            if sort_by_score:
+                df_result = df_result.sort_values(by='score', ascending=False).reset_index(drop=True)
+            else:
+                df_result = df_result.sort_values(by='code').reset_index(drop=True)
+            print(f'\n全部完成 共用时 {(time.time() - starttime):.2f} 秒 已选出 {len(df_result)} 只股票:')
+            print(df_result.to_string(index=False))
+            stocklist = df_result['code'].tolist()
+        else:
+            print(f'\n全部完成 共用时 {(time.time() - starttime):.2f} 秒 没有选出任何股票')
+            stocklist = []
     else:
-        # 进程数 读取CPU逻辑处理器个数
-        if os.cpu_count() > 8:
-            t_num = int(os.cpu_count() / 1.5)
+        # ====== 原有单策略模式（保持向后兼容）======
+        print(f'开始执行策略1(mode=fast)')
+        starttime_tick = time.time()
+        if 'single' in sys.argv[1:]:
+            stocklist = run_celue1(stocklist, df_today)
+        else:
+            # 进程数 读取CPU逻辑处理器个数
+            if os.cpu_count() > 8:
+                t_num = int(os.cpu_count() / 1.5)
+            else:
+                t_num = os.cpu_count() - 2
+            freeze_support()  # for Windows support
+            tqdm.set_lock(RLock())  # for managing output contention
+            p = Pool(processes=t_num, initializer=tqdm.set_lock, initargs=(tqdm.get_lock(),))
+            pool_result = []  # 存放pool池的返回对象列表
+            for i in range(0, t_num):
+                div = int(len(stocklist) / t_num)
+                mod = len(stocklist) % t_num
+                if i + 1 != t_num:
+                    pool_result.append(p.apply_async(run_celue1, args=(stocklist[i * div:(i + 1) * div], df_today, i,)))
+                else:
+                    pool_result.append(p.apply_async(run_celue1, args=(stocklist[i * div:(i + 1) * div + mod], df_today, i,)))
+
+            p.close()
+            p.join()
+
+            stocklist = []
+            for i in pool_result:
+                stocklist = stocklist + i.get()
+
+        print(f'策略1执行完毕，已选出 {len(stocklist):>d} 只股票 用时 {(time.time() - starttime_tick):>.2f} 秒')
+
+        print(f'开始执行策略2')
+        if '09:00:00' < time.strftime("%H:%M:%S", time.localtime()) < '16:00:00' and 'df_today' not in dir():
+            df_today = func.get_tdx_lastestquote(stocklist)
+
+        starttime_tick = time.time()
+        if 'single' in sys.argv[1:]:
+            stocklist = run_celue2(stocklist, HS300_信号, df_gbbq, df_today)
         else:
             t_num = os.cpu_count() - 2
-        freeze_support()  # for Windows support
-        tqdm.set_lock(RLock())  # for managing output contention
-        p = Pool(processes=t_num, initializer=tqdm.set_lock, initargs=(tqdm.get_lock(),))
-        pool_result = []  # 存放pool池的返回对象列表
-        for i in range(0, t_num):
-            div = int(len(stocklist) / t_num)
-            mod = len(stocklist) % t_num
-            if i + 1 != t_num:
-                # print(i, i * div, (i + 1) * div)
-                pool_result.append(p.apply_async(run_celue1, args=(stocklist[i * div:(i + 1) * div], df_today, i,)))
-            else:
-                # print(i, i * div, (i + 1) * div + mod)
-                pool_result.append(p.apply_async(run_celue1, args=(stocklist[i * div:(i + 1) * div + mod], df_today, i,)))
+            freeze_support()
+            tqdm.set_lock(RLock())
+            p = Pool(processes=t_num, initializer=tqdm.set_lock, initargs=(tqdm.get_lock(),))
+            pool_result = []
+            for i in range(0, t_num):
+                div = int(len(stocklist) / t_num)
+                mod = len(stocklist) % t_num
+                if i + 1 != t_num:
+                    pool_result.append(p.apply_async(run_celue2, args=(stocklist[i * div:(i + 1) * div], HS300_信号, df_gbbq, df_today, i,)))
+                else:
+                    pool_result.append(p.apply_async(run_celue2, args=(stocklist[i * div:(i + 1) * div + mod], HS300_信号, df_gbbq, df_today, i,)))
 
-        # print('Waiting for all subprocesses done...')
-        p.close()
-        p.join()
+            p.close()
+            p.join()
 
-        stocklist = []
-        # 读取pool的返回对象列表。i.get()是读取方法。拼接每个子进程返回的df
-        for i in pool_result:
-            stocklist = stocklist + i.get()
+            stocklist = []
+            for i in pool_result:
+                stocklist = stocklist + i.get()
 
-    print(f'策略1执行完毕，已选出 {len(stocklist):>d} 只股票 用时 {(time.time() - starttime_tick):>.2f} 秒')
-    # print(stocklist)
+        print(f'策略2执行完毕，已选出 {len(stocklist):>d} 只股票 用时 {(time.time() - starttime_tick):>.2f} 秒')
 
-    print(f'开始执行策略2')
-    # 如果没有df_today
-    if '09:00:00' < time.strftime("%H:%M:%S", time.localtime()) < '16:00:00' and 'df_today' not in dir():
-        df_today = func.get_tdx_lastestquote(stocklist)  # 获取当前最新行情
-
-    starttime_tick = time.time()
-    if 'single' in sys.argv[1:]:
-        stocklist = run_celue2(stocklist, HS300_信号, df_gbbq, df_today)
-    else:
-        # 由于df_dict字典占用超多内存资源，导致多进程效率还不如单进程
-        t_num = os.cpu_count() - 2  # 进程数 读取CPU逻辑处理器个数
-        freeze_support()  # for Windows support
-        tqdm.set_lock(RLock())  # for managing output contention
-        p = Pool(processes=t_num, initializer=tqdm.set_lock, initargs=(tqdm.get_lock(),))
-        pool_result = []  # 存放pool池的返回对象列表
-        for i in range(0, t_num):
-            div = int(len(stocklist) / t_num)
-            mod = len(stocklist) % t_num
-            if i + 1 != t_num:
-                # print(i, i * div, (i + 1) * div)
-                pool_result.append(p.apply_async(run_celue2, args=(stocklist[i * div:(i + 1) * div], HS300_信号, df_gbbq, df_today, i,)))
-            else:
-                # print(i, i * div, (i + 1) * div + mod)
-                pool_result.append(p.apply_async(run_celue2, args=(stocklist[i * div:(i + 1) * div + mod], HS300_信号, df_gbbq, df_today, i,)))
-
-        # print('Waiting for all subprocesses done...')
-        p.close()
-        p.join()
-
-        stocklist = []
-        # 读取pool的返回对象列表。i.get()是读取方法。拼接每个子进程返回的df
-        for i in pool_result:
-            stocklist = stocklist + i.get()
-
-    print(f'策略2执行完毕，已选出 {len(stocklist):>d} 只股票 用时 {(time.time() - starttime_tick):>.2f} 秒')
-
-    # 结果
-    print(f'全部完成 共用时 {(time.time() - starttime):>.2f} 秒 已选出 {len(stocklist)} 只股票:')
-    print(stocklist)
+        print(f'全部完成 共用时 {(time.time() - starttime):>.2f} 秒 已选出 {len(stocklist)} 只股票:')
+        print(stocklist)
