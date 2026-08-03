@@ -45,6 +45,17 @@ from strategy_engine import StrategyEngine, load_engine_from_json, CompositeStra
 要剔除的通达信行业 = ["T1002", ]  # list类型。记事本打开 通达信目录\incon.dat，查看#TDXNHY标签的行业代码。T1002=证券
 
 
+def _align_bool(series, index):
+    """
+    将信号 Series 对齐到指定索引并转为 bool 类型。
+    - 用 reindex 处理索引类型/精度不一致或缺失日期的情况；
+    - 缺失位置统一填充为 False；
+    - 先 astype(bool) 再 fillna，避免 pandas 对 object 列做 downcast 时的 FutureWarning。
+    """
+    aligned = series.reindex(index)
+    return aligned.where(aligned.notna(), False).astype(bool)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description='为日线数据生成策略信号并持久化到 SQLite/CSV',
@@ -245,9 +256,13 @@ def compute_stock_signals(stockcode, HS300_信号, force_del=False, engine_confi
             engine = StrategyEngine.from_dict(engine_config)
             result = engine.evaluate_stock_series(df_slice, hs300_signal=HS300_信号,
                                                   start_date=start_date, end_date=end_date)
-            buy_signal = result['buy_signal']
+            # 统一以 df_slice.index 为准对齐，避免不同来源 Series 的索引类型/精度不一致
+            # （如 Timestamp 与 datetime64、或引擎内部重建索引）导致按标签 .get() 查找失败
+            slice_index = df_slice.index
+            buy_signal = _align_bool(result['buy_signal'], slice_index)
+            score = result['score'].reindex(slice_index)
             strategies = result['matched_strategies']
-            score = result['score']
+            strat_str = ','.join(strategies)
             # 卖出信号：若配置中含 is_sell 策略，则从引擎结果中识别；否则用 卖策略
             celue_mod = _ensure_celue()
             sell_names = engine.get_sell_strategy_names()
@@ -258,22 +273,28 @@ def compute_stock_signals(stockcode, HS300_信号, force_del=False, engine_confi
             else:
                 celue_sell = celue_mod.卖策略(df_slice, buy_signal,
                                          start_date=start_date, end_date=end_date)
+            celue_sell = _align_bool(celue_sell, slice_index)
 
-            df.loc[start_date:end_date, 'celue_buy'] = buy_signal
-            df.loc[start_date:end_date, 'celue_sell'] = celue_sell
-            df.loc[start_date:end_date, 'celue_strategies'] = df.loc[start_date:end_date].index.map(
-                lambda d: ','.join(strategies) if buy_signal.get(d, False) else ''
+            df.loc[start_date:end_date, 'celue_buy'] = buy_signal.values
+            df.loc[start_date:end_date, 'celue_sell'] = celue_sell.values
+            # 向量化生成触发策略列：买入信号为 True 的行写入命中策略名，否则为空串
+            # 使用 np.where + .values，避免 index.map 内对 Timestamp 标签做 .get() 查找
+            df.loc[start_date:end_date, 'celue_strategies'] = np.where(
+                buy_signal.values, strat_str, ''
             )
-            df.loc[start_date:end_date, 'celue_score'] = score
+            df.loc[start_date:end_date, 'celue_score'] = score.values
         else:
             # 旧版默认流程
             celue_mod = _ensure_celue()
             celue2 = celue_mod.策略2(df_slice, HS300_信号, start_date=start_date, end_date=end_date)
             celue_sell = celue_mod.卖策略(df_slice, celue2, start_date=start_date, end_date=end_date)
-            df.loc[start_date:end_date, 'celue_buy'] = celue2
-            df.loc[start_date:end_date, 'celue_sell'] = celue_sell
-            df.loc[start_date:end_date, 'celue_strategies'] = df.loc[start_date:end_date].index.map(
-                lambda d: '策略2' if celue2.get(d, False) else ''
+            slice_index = df_slice.index
+            celue2 = _align_bool(celue2, slice_index)
+            celue_sell = _align_bool(celue_sell, slice_index)
+            df.loc[start_date:end_date, 'celue_buy'] = celue2.values
+            df.loc[start_date:end_date, 'celue_sell'] = celue_sell.values
+            df.loc[start_date:end_date, 'celue_strategies'] = np.where(
+                celue2.values, '策略2', ''
             )
 
         df.reset_index(drop=True, inplace=True)
