@@ -24,7 +24,18 @@ import pandas as pd
 from tqdm import tqdm
 from rich import print
 
-import CeLue  # 个人策略文件，不分享
+# CeLue 依赖 talib，采用延迟导入，使本模块的 SQLite 工具函数可在无 talib 环境下独立使用
+CeLue = None
+
+
+def _ensure_celue():
+    global CeLue
+    if CeLue is None:
+        import CeLue as _CeLue
+        CeLue = _CeLue
+    return CeLue
+
+
 import func
 import user_config as ucfg
 from strategy_engine import StrategyEngine, load_engine_from_json, CompositeStrategy, Strategy
@@ -95,36 +106,64 @@ def init_db(db_path):
     conn.close()
 
 
-def save_df_to_db(db_path, df_signals):
-    """把策略信号 DataFrame 批量写入 SQLite（REPLACE 避免主键冲突）。"""
+def save_df_to_db(db_path, df_signals, batch_size=5000):
+    """
+    把策略信号 DataFrame 批量写入 SQLite（REPLACE 避免主键冲突）。
+
+    使用向量化的列数组 + executemany 批量提交，替代逐行 iterrows 单条插入，
+    在大批量信号（数万行）场景下性能提升显著。
+    """
     if df_signals is None or len(df_signals) == 0:
         return
-    conn = sqlite3.connect(db_path)
-    rows = []
-    for _, row in df_signals.iterrows():
-        trade_date = pd.to_datetime(row['date']).strftime('%Y-%m-%d')
-        strategies = row.get('celue_strategies', '')
-        if isinstance(strategies, (list, tuple)):
-            strategies = ','.join(strategies)
-        score = row.get('celue_score', None)
-        if pd.isna(score):
-            score = None
-        rows.append((
-            str(row['code']), trade_date,
-            int(bool(row['celue_buy'])), int(bool(row['celue_sell'])),
-            strategies, score,
-            float(row.get('open', np.nan)), float(row.get('high', np.nan)),
-            float(row.get('low', np.nan)), float(row.get('close', np.nan)),
-            float(row.get('amount', np.nan)),
-        ))
-    conn.executemany(
+
+    # 统一类型并构造批量元组列表（避免 iterrows 的 Python 级逐行开销）
+    df = df_signals.copy()
+    df['trade_date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
+    df['code'] = df['code'].astype(str)
+    df['celue_buy'] = df['celue_buy'].astype(bool).astype(int)
+    df['celue_sell'] = df['celue_sell'].astype(bool).astype(int)
+
+    # strategies 列可能是 list/tuple 或逗号字符串，统一转为字符串
+    def _fmt_strategies(v):
+        if isinstance(v, (list, tuple)):
+            return ','.join(str(x) for x in v)
+        if pd.isna(v):
+            return ''
+        return str(v)
+
+    if 'celue_strategies' in df.columns:
+        df['strategies'] = df['celue_strategies'].apply(_fmt_strategies)
+    else:
+        df['strategies'] = ''
+
+    # score 列空值转 None
+    if 'celue_score' in df.columns:
+        df['score'] = pd.to_numeric(df['celue_score'], errors='coerce')
+    else:
+        df['score'] = np.nan
+
+    cols = ['code', 'trade_date', 'celue_buy', 'celue_sell', 'strategies', 'score',
+            'open', 'high', 'low', 'close', 'amount']
+    for c in ['open', 'high', 'low', 'close', 'amount']:
+        if c not in df.columns:
+            df[c] = np.nan
+
+    # 利用 numpy 数组一次性转成 list[tuple]，比 iterrows 快数倍
+    records = list(zip(*[df[c].where(pd.notna(df[c]), None).tolist() for c in cols]))
+
+    sql = (
         'INSERT OR REPLACE INTO signals '
         '(code, trade_date, celue_buy, celue_sell, strategies, score, open, high, low, close, amount) '
-        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        rows,
+        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
     )
-    conn.commit()
-    conn.close()
+    conn = sqlite3.connect(db_path)
+    try:
+        # 分批 executemany，避免单次事务过大
+        for start in range(0, len(records), batch_size):
+            conn.executemany(sql, records[start:start + batch_size])
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------- #
@@ -210,13 +249,14 @@ def compute_stock_signals(stockcode, HS300_信号, force_del=False, engine_confi
             strategies = result['matched_strategies']
             score = result['score']
             # 卖出信号：若配置中含 is_sell 策略，则从引擎结果中识别；否则用 卖策略
+            celue_mod = _ensure_celue()
             sell_names = engine.get_sell_strategy_names()
             if sell_names:
                 # 卖出信号由组合信号中命中的卖出策略决定；这里用独立方式再算一次卖策略
-                celue_sell = CeLue.卖策略(df_slice, buy_signal,
+                celue_sell = celue_mod.卖策略(df_slice, buy_signal,
                                          start_date=start_date, end_date=end_date)
             else:
-                celue_sell = CeLue.卖策略(df_slice, buy_signal,
+                celue_sell = celue_mod.卖策略(df_slice, buy_signal,
                                          start_date=start_date, end_date=end_date)
 
             df.loc[start_date:end_date, 'celue_buy'] = buy_signal
@@ -227,8 +267,9 @@ def compute_stock_signals(stockcode, HS300_信号, force_del=False, engine_confi
             df.loc[start_date:end_date, 'celue_score'] = score
         else:
             # 旧版默认流程
-            celue2 = CeLue.策略2(df_slice, HS300_信号, start_date=start_date, end_date=end_date)
-            celue_sell = CeLue.卖策略(df_slice, celue2, start_date=start_date, end_date=end_date)
+            celue_mod = _ensure_celue()
+            celue2 = celue_mod.策略2(df_slice, HS300_信号, start_date=start_date, end_date=end_date)
+            celue_sell = celue_mod.卖策略(df_slice, celue2, start_date=start_date, end_date=end_date)
             df.loc[start_date:end_date, 'celue_buy'] = celue2
             df.loc[start_date:end_date, 'celue_sell'] = celue_sell
             df.loc[start_date:end_date, 'celue_strategies'] = df.loc[start_date:end_date].index.map(
@@ -260,6 +301,14 @@ def _pool_init(hs300_signal, force_del, engine_config):
     _HS300 = hs300_signal
     _FORCE_DEL = force_del
     _ENGINE_CONFIG = engine_config
+    # 若使用多因子引擎，在子进程启动时主动校验策略函数可解析，
+    # 让导入/配置错误在初始化阶段就明确抛出，而不是在每只股票上静默失败
+    if engine_config is not None:
+        try:
+            StrategyEngine.from_dict(engine_config).validate()
+        except Exception as e:
+            print(f'[red]子进程策略配置校验失败: {e}[/red]')
+            raise
 
 
 def _pool_worker(args):
@@ -289,6 +338,12 @@ if __name__ == '__main__':
     if args.multi_factor:
         print(f'[green]启用多因子策略: {args.multi_factor}[/green]')
         engine = load_engine_from_json(args.multi_factor)
+        # 在主进程先校验策略配置，使导入/配置错误在派生子进程前就明确暴露
+        try:
+            engine.validate()
+        except Exception as e:
+            print(f'[red]策略配置校验失败: {e}[/red]')
+            sys.exit(2)
         engine_config = _engine_to_dict(engine.root)
     else:
         engine_config = None  # None 表示使用旧版默认策略（策略2 + 卖策略）
@@ -302,7 +357,7 @@ if __name__ == '__main__':
                            index_col=None, encoding='gbk', dtype={'code': str})
     df_hs300['date'] = pd.to_datetime(df_hs300['date'], format='%Y-%m-%d')
     df_hs300.set_index('date', drop=False, inplace=True)
-    HS300_信号 = CeLue.策略HS300(df_hs300)
+    HS300_信号 = _ensure_celue().策略HS300(df_hs300)
     stocklist = [i[:-4] for i in os.listdir(ucfg.tdx['pickle'])]
 
     if args.single:

@@ -188,6 +188,8 @@ def _pool_init(engine_config, hs300_signal, df_today, df_gbbq):
         _engine = StrategyEngine.from_dict(engine_config)
     else:
         _engine = StrategyEngine.default_single_strategy()
+    # 主动校验所有策略函数可解析，避免在子进程逐股票求值时被静默吞掉
+    _engine.validate()
     _HS300 = hs300_signal
     _df_today = df_today
     _df_gbbq = df_gbbq
@@ -334,10 +336,25 @@ if __name__ == '__main__':
     if use_multi_factor:
         print(f'开始执行多因子组合策略引擎')
         starttime_tick = time.time()
+        # 在主进程先校验策略配置，使导入/配置错误在派生子进程前就明确暴露
+        try:
+            engine.validate()
+        except Exception as e:
+            print(f'[red]策略配置校验失败: {e}[/red]')
+            sys.exit(2)
         results = run_engine(stocklist, engine, HS300_信号, df_today, df_gbbq,
                              single_process=args.single)
+
+        # 分离处理出错的股票，避免把异常结果当作正常（未命中）结果静默吞掉
+        error_results = [r for r in results if 'error' in r]
+        ok_results = [r for r in results if 'error' not in r]
+        if error_results:
+            print(f'[yellow]警告: 共 {len(error_results)} 只股票处理失败，已从选股结果中剔除:[/yellow]')
+            for r in error_results:
+                print(f"  [yellow]{r['stock']}: {r['error']}[/yellow]")
+
         # 只保留命中的股票
-        matched_results = [r for r in results if r.get('matched')]
+        matched_results = [r for r in ok_results if r.get('matched')]
         # 按综合评分降序排列
         matched_results.sort(key=lambda x: x.get('score_normalized', 0), reverse=True)
         已选出股票列表 = [r['stock'] for r in matched_results]
@@ -349,7 +366,8 @@ if __name__ == '__main__':
                 print(f"{r['stock']}    {r['score_normalized']:>6.2f}    {r['score']:>6.2f}    {','.join(r['matched_strategies'])}")
         print(f'全部完成 共用时 {(time.time() - starttime):>.2f} 秒 已选出 {len(已选出股票列表)} 只股票:')
         print(已选出股票列表)
-        sys.exit(0)
+        # 存在处理失败的股票时，以非零退出码提示调用方
+        sys.exit(1 if error_results else 0)
 
     # ------------------------------------------------------------------ #
     # 旧版两阶段策略流程（完全保留原逻辑）

@@ -106,15 +106,43 @@ class Strategy(BaseStrategy):
         self.is_sell = is_sell
 
     def _resolve_func(self):
-        """延迟导入并解析 CeLue 模块中的策略函数，避免循环导入。"""
+        """
+        延迟导入并解析 CeLue 模块中的策略函数，避免循环导入。
+
+        - 若 func 本身已可调用，直接返回。
+        - 若 func 为字符串，在首次求值时从 CeLue 模块按名称解析；
+          解析失败（模块导入失败或函数不存在）会抛出带有明确上下文的异常，
+          而不是返回字符串导致后续静默失败。
+        """
         if self._func_resolved:
             return self._func
-        import CeLue  # 个人策略文件，延迟导入
+        try:
+            import CeLue  # 个人策略文件，延迟导入
+        except ImportError as e:
+            raise ImportError(
+                f'策略 "{self.name}" 需要导入 CeLue 模块，但导入失败: {e}。'
+                f'请确认 CeLue.py 位于工作目录且其依赖(如 talib)已安装。'
+            ) from e
         if not hasattr(CeLue, self._func):
-            raise AttributeError(f'CeLue 模块中不存在名为 "{self._func}" 的策略函数')
+            raise AttributeError(
+                f'策略 "{self.name}" 引用的函数 "{self._func}" 在 CeLue 模块中不存在。'
+                f'请检查策略配置中的 func/name 字段。'
+            )
         self._func = getattr(CeLue, self._func)
+        if not callable(self._func):
+            raise TypeError(
+                f'策略 "{self.name}" 引用的 "{self._func}" 不是可调用对象。'
+            )
         self._func_resolved = True
         return self._func
+
+    def validate(self):
+        """
+        主动解析并校验底层策略函数，使配置错误在引擎启动/派生子进程前就暴露，
+        而不是在子进程求值时被静默吞掉。
+        """
+        self._resolve_func()
+        return True
 
     def evaluate(self, df, context=None):
         if context is None:
@@ -264,6 +292,22 @@ class StrategyEngine:
 
     def __init__(self, root_strategy=None):
         self.root = root_strategy
+
+    def validate(self):
+        """
+        遍历整棵策略树，主动解析并校验所有叶子节点引用的策略函数，
+        使导入/配置错误在引擎启动（或多进程派生）前就明确抛出，避免子进程静默失败。
+        """
+        def _walk(node):
+            if isinstance(node, Strategy):
+                node.validate()
+            elif isinstance(node, CompositeStrategy):
+                for c in node.children:
+                    _walk(c)
+
+        if self.root is not None:
+            _walk(self.root)
+        return self
 
     # ------------------------------------------------------------------ #
     # 工厂方法：从 dict 配置构建引擎

@@ -112,9 +112,14 @@ class StockMonitor:
         self._pause_event.set()  # 初始为运行状态
         self._thread = None
 
+        # HS300 信号在后台线程中写入、在 _evaluate_signals 中读取，使用专用锁保护避免竞态
+        self._hs300_signal = None
+        self._hs300_lock = threading.Lock()
+
         # 记录每只股票上一次的信号状态，用于边沿检测（只在信号新触发时报警）
         self._last_buy_state = {}   # code -> bool
         self._last_sell_state = {}  # code -> bool
+        self._signal_state_lock = threading.Lock()  # 保护边沿检测状态字典
 
         # 运行统计
         self._cycle_count = 0
@@ -213,6 +218,24 @@ class StockMonitor:
         with self._state_lock:
             self._alert_count += 1
 
+    def _get_hs300_signal(self, df_stock):
+        """
+        线程安全地获取 HS300 信号。
+        若 HS300 信号尚未加载或加载失败(None)，则返回与 df_stock 索引对齐的全 True Series，
+        避免把 None 传入 CeLue.策略2 导致内部异常。
+        """
+        with self._hs300_lock:
+            signal = self._hs300_signal
+        if signal is None:
+            # 回退：全部交易日都允许买入（与 xuangu.py 中 HS300 不满足条件时强制 True 的逻辑一致）
+            return pd.Series(True, index=df_stock.index, dtype=bool)
+        return signal
+
+    def _set_hs300_signal(self, signal):
+        """线程安全地设置 HS300 信号。"""
+        with self._hs300_lock:
+            self._hs300_signal = signal
+
     def _load_stock_df(self, stockcode, df_today):
         """读取本地 pkl 并合并实时行情。"""
         pklfile = ucfg.tdx['pickle'] + os.sep + stockcode + '.pkl'
@@ -228,13 +251,15 @@ class StockMonitor:
     def _evaluate_signals(self, stockcode, df_stock, df_today_row):
         """
         计算单只股票的买入/卖出信号。
-        返回 (buy_signal: bool, sell_signal: bool, buy_strategies: list, price, score)
+        返回 (buy_signal: bool, sell_signal: bool, buy_strategies: list, sell_strategies: list, price, score)
         """
         price = float(df_stock['close'].iat[-1])
+        # 线程安全地获取 HS300 信号；为 None 时自动回退为全 True
+        hs300_signal = self._get_hs300_signal(df_stock)
 
         if self.engine is not None and self.engine.root is not None:
             # 多因子引擎模式
-            result = self.engine.evaluate_stock(df_stock)
+            result = self.engine.evaluate_stock(df_stock, hs300_signal=hs300_signal)
             buy_signal = result['matched']
             buy_strategies = result['matched_strategies']
             score = result.get('score_normalized')
@@ -249,7 +274,7 @@ class StockMonitor:
             else:
                 try:
                     celue_mod = _ensure_celue()
-                    celue2 = celue_mod.策略2(df_stock, self._hs300_signal)
+                    celue2 = celue_mod.策略2(df_stock, hs300_signal)
                     sell_series = celue_mod.卖策略(df_stock, celue2)
                     sell_signal = bool(sell_series.iat[-1])
                     if sell_signal:
@@ -269,7 +294,7 @@ class StockMonitor:
         sell_signal = False
         sell_strategies = []
         try:
-            celue2 = celue_mod.策略2(df_stock, self._hs300_signal)
+            celue2 = celue_mod.策略2(df_stock, hs300_signal)
             sell_series = celue_mod.卖策略(df_stock, celue2)
             sell_signal = bool(sell_series.iat[-1])
             if sell_signal:
@@ -299,14 +324,15 @@ class StockMonitor:
                     code, df_stock, df_today)
 
                 # 边沿检测：只在信号从 False 变为 True 时预警
-                prev_buy = self._last_buy_state.get(code, False)
-                prev_sell = self._last_sell_state.get(code, False)
-                if buy and not prev_buy:
-                    self._log_alert(code, 'BUY', price, buy_strats, score)
-                if sell and not prev_sell:
-                    self._log_alert(code, 'SELL', price, sell_strats, score)
-                self._last_buy_state[code] = buy
-                self._last_sell_state[code] = sell
+                with self._signal_state_lock:
+                    prev_buy = self._last_buy_state.get(code, False)
+                    prev_sell = self._last_sell_state.get(code, False)
+                    if buy and not prev_buy:
+                        self._log_alert(code, 'BUY', price, buy_strats, score)
+                    if sell and not prev_sell:
+                        self._log_alert(code, 'SELL', price, sell_strats, score)
+                    self._last_buy_state[code] = buy
+                    self._last_sell_state[code] = sell
             except Exception as e:
                 print(f'[red]处理 {code} 时出错: {e}[/red]')
 
@@ -321,10 +347,11 @@ class StockMonitor:
             if '09:00:00' < time.strftime("%H:%M:%S", time.localtime()) < '16:00:00':
                 df_today_hs = func.get_tdx_lastestquote((1, '000300'))
                 df_hs300 = func.update_stockquote('000300', df_hs300, df_today_hs)
-            self._hs300_signal = _ensure_celue().策略HS300(df_hs300)
+            self._set_hs300_signal(_ensure_celue().策略HS300(df_hs300))
         except Exception as e:
-            print(f'[yellow]HS300 信号加载失败，使用全 True: {e}[/yellow]')
-            self._hs300_signal = None
+            print(f'[yellow]HS300 信号加载失败，使用全 True 回退信号: {e}[/yellow]')
+            # 不设置为 None；置 None 后 _get_hs300_signal 会在每只股票上动态构造全 True
+            self._set_hs300_signal(None)
 
         print('[cyan]监控线程进入主循环[/cyan]')
         while not self._stop_event.is_set():
