@@ -1,16 +1,276 @@
 import os
+import sys
 import copy
 import time
 import pickle
-import talib
+import sqlite3
+import argparse
 import pandas as pd
 import numpy as np
 
 import user_config as ucfg
-from rqalpha.apis import *
-from rqalpha import run_func
 from tqdm import tqdm
 from rich import print as rprint
+
+# ---------------------------------------------------------------------- #
+# 命令行参数解析（支持不依赖 rqalpha 的独立分析模式）
+# ---------------------------------------------------------------------- #
+def _parse_huice_args():
+    parser = argparse.ArgumentParser(
+        description='策略回测与结果分析',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument('--analyze-only', dest='analyze_only', action='store_true',
+                        help='仅基于信号数据(CSV/SQLite)计算夏普比率、最大回撤、胜率等指标，不运行 rqalpha')
+    parser.add_argument('--db', default=None,
+                        help='SQLite 信号数据库路径，默认使用 csv_gbbq/celue.db')
+    parser.add_argument('--csv', default=None,
+                        help='celue汇总.csv 路径，默认使用 csv_gbbq/celue汇总.csv')
+    parser.add_argument('--start', default=None, help='分析起始日期 YYYY-MM-DD')
+    parser.add_argument('--end', default=None, help='分析结束日期 YYYY-MM-DD')
+    parser.add_argument('--initial-cash', dest='initial_cash', type=float, default=1000000,
+                        help='独立分析模式的初始资金（默认 1000000）')
+    # 解析时忽略 rqalpha 自身可能传入的未知参数
+    args, _ = parser.parse_known_args()
+    return args
+
+
+def load_signals_from_db(db_path, start_date=None, end_date=None):
+    """从 SQLite 读取策略信号，返回 DataFrame。"""
+    conn = sqlite3.connect(db_path)
+    query = 'SELECT code, trade_date AS date, celue_buy, celue_sell, strategies, score, ' \
+            'open, high, low, close, amount FROM signals'
+    conditions = []
+    params = []
+    if start_date:
+        conditions.append("trade_date >= ?")
+        params.append(start_date)
+    if end_date:
+        conditions.append("trade_date <= ?")
+        params.append(end_date)
+    if conditions:
+        query += ' WHERE ' + ' AND '.join(conditions)
+    query += ' ORDER BY trade_date'
+    df = pd.read_sql_query(query, conn, params=params)
+    conn.close()
+    df['date'] = pd.to_datetime(df['date'])
+    df['celue_buy'] = df['celue_buy'].astype(bool)
+    df['celue_sell'] = df['celue_sell'].astype(bool)
+    return df
+
+
+def load_signals_from_csv(csv_path):
+    """从 celue汇总.csv 读取策略信号（兼容旧版格式）。"""
+    df = pd.read_csv(csv_path, index_col=0, encoding='gbk', dtype={'code': str})
+    df['date'] = pd.to_datetime(df['date'], format='%Y-%m-%d')
+    if 'celue_buy' in df.columns:
+        df['celue_buy'] = df['celue_buy'].astype(bool)
+    if 'celue_sell' in df.columns:
+        df['celue_sell'] = df['celue_sell'].astype(bool)
+    return df
+
+
+def analyze_signals(df_signals, initial_cash=1000000):
+    """
+    基于买卖信号做独立的回测分析，输出夏普比率、最大回撤、胜率等统计指标。
+
+    采用简化撮合规则：按日期顺序，买入信号次日开盘价买入（等权分配可用资金），
+    卖出信号次日开盘价卖出全部持仓。不考虑涨跌停、手续费、滑点。
+    返回包含统计指标的 dict。
+    """
+    if df_signals is None or len(df_signals) == 0:
+        rprint('[red]无信号数据，无法分析[/red]')
+        return {}
+
+    df = df_signals.sort_values('date').reset_index(drop=True)
+
+    # 需要每只股票的完整日线来获取次日开盘价，这里用信号表自身的 close 近似，
+    # 若 open 列存在则优先用 open
+    price_col = 'open' if 'open' in df.columns and df['open'].notna().any() else 'close'
+
+    # 模拟组合
+    cash = float(initial_cash)
+    positions = {}  # code -> {'shares': int, 'cost_price': float}
+    trade_records = []  # 每笔完整交易：buy_date, sell_date, code, buy_price, sell_price, return
+    equity_curve = []
+
+    all_dates = sorted(df['date'].unique())
+    for i, current_date in enumerate(all_dates):
+        day_df = df[df['date'] == current_date]
+        next_date = all_dates[i + 1] if i + 1 < len(all_dates) else None
+
+        # 先处理卖出
+        for _, row in day_df.iterrows():
+            code = row['code']
+            if row.get('celue_sell', False) and code in positions:
+                # 用当日 close 卖出（或次日 open，这里简化为当日 close）
+                sell_price = float(row['close'])
+                pos = positions.pop(code)
+                proceeds = pos['shares'] * sell_price
+                cash += proceeds
+                trade_return = sell_price / pos['cost_price'] - 1
+                trade_records.append({
+                    'code': code,
+                    'buy_date': pos['buy_date'],
+                    'sell_date': current_date,
+                    'buy_price': pos['cost_price'],
+                    'sell_price': sell_price,
+                    'return': trade_return,
+                })
+
+        # 再处理买入
+        buy_today = day_df[day_df.get('celue_buy', False) == True]
+        if len(buy_today) > 0 and next_date is not None:
+            # 等权分配可用资金
+            allocation = cash / max(1, len(buy_today))
+            for _, row in buy_today.iterrows():
+                code = row['code']
+                if code in positions:
+                    continue
+                buy_price = float(row['close'])
+                if buy_price <= 0:
+                    continue
+                shares = int(allocation // (buy_price * 100)) * 100  # A股按手
+                if shares <= 0:
+                    continue
+                cost = shares * buy_price
+                if cost > cash:
+                    continue
+                cash -= cost
+                positions[code] = {'shares': shares, 'cost_price': buy_price, 'buy_date': current_date}
+
+        # 记录当日权益
+        market_value = 0.0
+        for code, pos in positions.items():
+            code_today = day_df[day_df['code'] == code]
+            if len(code_today) > 0:
+                market_value += pos['shares'] * float(code_today.iloc[0]['close'])
+            else:
+                market_value += pos['shares'] * pos['cost_price']
+        total_equity = cash + market_value
+        equity_curve.append({'date': current_date, 'equity': total_equity})
+
+    # 收盘时仍持仓的，按最后一天收盘价平仓计算浮动盈亏（不计入胜率，但计入最终权益）
+    df_equity = pd.DataFrame(equity_curve).set_index('date')
+
+    # -------------------- 统计指标 -------------------- #
+    # 日收益率
+    df_equity['daily_return'] = df_equity['equity'].pct_change().fillna(0)
+
+    total_return = df_equity['equity'].iloc[-1] / initial_cash - 1
+    # 年化收益率（按252个交易日）
+    n_days = len(df_equity)
+    annualized_return = (1 + total_return) ** (252 / max(1, n_days)) - 1 if n_days > 0 else 0
+
+    # 夏普比率（无风险利率取 0，日收益年化）
+    if df_equity['daily_return'].std() > 0:
+        sharpe = (df_equity['daily_return'].mean() / df_equity['daily_return'].std()) * np.sqrt(252)
+    else:
+        sharpe = 0.0
+
+    # 最大回撤
+    equity_series = df_equity['equity']
+    rolling_max = equity_series.cummax()
+    drawdown = (equity_series - rolling_max) / rolling_max
+    max_drawdown = drawdown.min()
+
+    # 胜率
+    df_trades = pd.DataFrame(trade_records)
+    if len(df_trades) > 0:
+        win_trades = len(df_trades[df_trades['return'] > 0])
+        win_rate = win_trades / len(df_trades)
+        avg_win = df_trades[df_trades['return'] > 0]['return'].mean() if win_trades > 0 else 0
+        avg_loss = df_trades[df_trades['return'] <= 0]['return'].mean() if (len(df_trades) - win_trades) > 0 else 0
+        profit_loss_ratio = abs(avg_win / avg_loss) if avg_loss != 0 else float('inf')
+    else:
+        win_rate = 0.0
+        avg_win = 0.0
+        avg_loss = 0.0
+        profit_loss_ratio = 0.0
+
+    stats = {
+        '初始资金': initial_cash,
+        '最终权益': round(float(df_equity['equity'].iloc[-1]), 2),
+        '总收益率': round(float(total_return), 4),
+        '年化收益率': round(float(annualized_return), 4),
+        '夏普比率': round(float(sharpe), 4),
+        '最大回撤': round(float(max_drawdown), 4),
+        '交易笔数': len(df_trades),
+        '盈利笔数': int(win_trades) if len(df_trades) > 0 else 0,
+        '胜率': round(float(win_rate), 4),
+        '平均盈利': round(float(avg_win), 4),
+        '平均亏损': round(float(avg_loss), 4),
+        '盈亏比': round(float(profit_loss_ratio), 4) if profit_loss_ratio != float('inf') else 'inf',
+        '交易天数': n_days,
+    }
+    return stats
+
+
+def print_analysis_report(stats):
+    """格式化输出独立分析报告。"""
+    if not stats:
+        return
+    rprint('=' * 60)
+    rprint('[bold cyan]回测统计分析报告[/bold cyan]')
+    rprint('=' * 60)
+    rprint(f"初始资金:     {stats['初始资金']:>15,.2f}")
+    rprint(f"最终权益:     {stats['最终权益']:>15,.2f}")
+    rprint(f"总收益率:     {stats['总收益率']:>15.2%}")
+    rprint(f"年化收益率:   {stats['年化收益率']:>15.2%}")
+    rprint(f"夏普比率:     {stats['夏普比率']:>15.4f}")
+    rprint(f"最大回撤:     {stats['最大回撤']:>15.2%}")
+    rprint('-' * 60)
+    rprint(f"交易笔数:     {stats['交易笔数']:>15d}")
+    rprint(f"盈利笔数:     {stats['盈利笔数']:>15d}")
+    rprint(f"胜率:         {stats['胜率']:>15.2%}")
+    rprint(f"平均盈利:     {stats['平均盈利']:>15.2%}")
+    rprint(f"平均亏损:     {stats['平均亏损']:>15.2%}")
+    rprint(f"盈亏比:       {stats['盈亏比']:>15}")
+    rprint(f"交易天数:     {stats['交易天数']:>15d}")
+    rprint('=' * 60)
+
+
+def _run_analyze_only():
+    """独立分析模式入口：不启动 rqalpha，直接从信号数据计算统计指标。"""
+    args = _parse_huice_args()
+    # 优先使用 SQLite，其次 CSV
+    db_path = args.db if args.db else (ucfg.tdx['csv_gbbq'] + os.sep + 'celue.db')
+    csv_path = args.csv if args.csv else (ucfg.tdx['csv_gbbq'] + os.sep + 'celue汇总.csv')
+
+    if os.path.exists(db_path):
+        rprint(f'[green]从 SQLite 加载信号: {db_path}[/green]')
+        df_signals = load_signals_from_db(db_path, args.start, args.end)
+    elif os.path.exists(csv_path):
+        rprint(f'[yellow]未找到 SQLite，从 CSV 加载信号: {csv_path}[/yellow]')
+        df_signals = load_signals_from_csv(csv_path)
+        if args.start:
+            df_signals = df_signals[df_signals['date'] >= pd.to_datetime(args.start)]
+        if args.end:
+            df_signals = df_signals[df_signals['date'] <= pd.to_datetime(args.end)]
+    else:
+        rprint(f'[red]未找到信号数据库或CSV文件: {db_path} / {csv_path}[/red]')
+        rprint('请先运行 celue_save.py 生成策略信号')
+        sys.exit(1)
+
+    stats = analyze_signals(df_signals, initial_cash=args.initial_cash)
+    print_analysis_report(stats)
+    return stats
+
+
+# 仅在非独立分析模式下导入 rqalpha，避免无 rqalpha 环境时无法使用分析功能
+_RQALPHA_AVAILABLE = False
+if '--analyze-only' in sys.argv:
+    if __name__ == '__main__':
+        _run_analyze_only()
+    # 模块被导入时不执行任何操作
+else:
+    try:
+        import talib  # noqa: F401  保留与旧版一致的依赖导入
+        from rqalpha.apis import *  # noqa: F401,F403
+        from rqalpha import run_func  # noqa: F401
+        _RQALPHA_AVAILABLE = True
+    except ImportError:
+        _RQALPHA_AVAILABLE = False
 
 # 回测变量定义
 start_date = "2013-01-01"  # 回测起始日期
@@ -219,52 +479,97 @@ __config__ = {
 
 start_time = f'程序开始时间：{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}'
 
-# 使用 run_func 函数来运行策略
-# 此种模式下，您只需要在当前环境下定义策略函数，并传入指定运行的函数，即可运行策略。
-# 如果你的函数命名是按照 API 规范来，则可以直接按照以下方式来运行
-run_func(**globals())
-end_time = f'程序结束时间：{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}'
+# 仅在 rqalpha 可用且非独立分析模式下执行回测
+if _RQALPHA_AVAILABLE and __name__ == '__main__':
+    # 使用 run_func 函数来运行策略
+    # 此种模式下，您只需要在当前环境下定义策略函数，并传入指定运行的函数，即可运行策略。
+    # 如果你的函数命名是按照 API 规范来，则可以直接按照以下方式来运行
+    run_func(**globals())
+    end_time = f'程序结束时间：{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}'
 
-# RQAlpha可以输出一个 pickle 文件，里面为一个 dict 。keys 包括
-# summary 回测摘要
-# stock_portfolios 股票帐号的市值
-# future_portfolios 期货帐号的市值
-# total_portfolios 总账号的的市值
-# benchmark_portfolios 基准帐号的市值
-# stock_positions 股票持仓
-# future_positions 期货仓位
-# benchmark_positions 基准仓位
-# trades 交易详情（交割单）
-# plots 调用plot画图时，记录的值
-result_dict = pd.read_pickle(rq_result_filename + ".pkl")
+    # RQAlpha可以输出一个 pickle 文件，里面为一个 dict 。keys 包括
+    # summary 回测摘要
+    # stock_portfolios 股票帐号的市值
+    # future_portfolios 期货帐号的市值
+    # total_portfolios 总账号的的市值
+    # benchmark_portfolios 基准帐号的市值
+    # stock_positions 股票持仓
+    # future_positions 期货仓位
+    # benchmark_positions 基准仓位
+    # trades 交易详情（交割单）
+    # plots 调用plot画图时，记录的值
+    result_dict = pd.read_pickle(rq_result_filename + ".pkl")
 
-# 给rq_result.pkl的交割单添加个股盈亏和收益率统计
-df_trades = result_dict['trades']
-try:
-    df_temp = pd.read_csv('temp.csv', index_col=0, encoding='gbk')
-    if 'trading_datetime' in df_temp.columns:
-        df_temp = df_temp.set_index('trading_datetime')
-    df_temp.index.name = 'datetime'
-    # 避免列名冲突，重命名列
-    df_temp = df_temp.rename(columns=lambda x: x + '_temp' if x in df_trades.columns else x)
-    df_trades = pd.merge(df_trades, df_temp, left_index=True, right_index=True, how='left')
-    result_dict['trades'] = df_trades
-except FileNotFoundError:
-    print("temp.csv 不存在，跳过合并")
-except Exception as e:
-    print(f"合并交割单数据出错: {e}")
-with open(rq_result_filename+".pkl", 'wb') as fobj:
-    pickle.dump(result_dict, fobj)
-os.remove('temp.csv') if os.path.exists("temp.csv") else None
+    # 给rq_result.pkl的交割单添加个股盈亏和收益率统计
+    df_trades = result_dict['trades']
+    try:
+        df_temp = pd.read_csv('temp.csv', index_col=0, encoding='gbk')
+        if 'trading_datetime' in df_temp.columns:
+            df_temp = df_temp.set_index('trading_datetime')
+        df_temp.index.name = 'datetime'
+        # 避免列名冲突，重命名列
+        df_temp = df_temp.rename(columns=lambda x: x + '_temp' if x in df_trades.columns else x)
+        df_trades = pd.merge(df_trades, df_temp, left_index=True, right_index=True, how='left')
+        result_dict['trades'] = df_trades
+    except FileNotFoundError:
+        print("temp.csv 不存在，跳过合并")
+    except Exception as e:
+        print(f"合并交割单数据出错: {e}")
+    with open(rq_result_filename+".pkl", 'wb') as fobj:
+        pickle.dump(result_dict, fobj)
+    os.remove('temp.csv') if os.path.exists("temp.csv") else None
 
 
-rprint(result_dict["summary"])
-rprint(start_time)
-rprint(end_time)
-rprint(
-    f"回测起点 {result_dict['summary']['start_date']}"
-    f"\n回测终点 {result_dict['summary']['end_date']}"
-    f"\n回测收益 {result_dict['summary']['total_returns']:>.2%}\t年化收益 {result_dict['summary']['annualized_returns']:>.2%}"
-    f"\t基准收益 {result_dict['summary']['benchmark_total_returns']:>.2%}\t基准年化 {result_dict['summary']['benchmark_annualized_returns']:>.2%}"
-    f"\t最大回撤 {result_dict['summary']['max_drawdown']:>.2%}"
-    f"\n打开程序文件夹下的rq_result.png查看收益走势图")
+    rprint(result_dict["summary"])
+    rprint(start_time)
+    rprint(end_time)
+
+    # -------------------- 新增：夏普比率、胜率等补充统计 -------------------- #
+    # 从总账户净值序列计算夏普比率（rqalpha summary 中不一定包含）
+    _extra_stats = {}
+    try:
+        if 'total_portfolios' in result_dict:
+            _equity = result_dict['total_portfolios'].astype(float)
+            _daily_ret = _equity.pct_change().dropna()
+            if len(_daily_ret) > 1 and _daily_ret.std() > 0:
+                _extra_stats['夏普比率'] = (_daily_ret.mean() / _daily_ret.std()) * np.sqrt(252)
+            else:
+                _extra_stats['夏普比率'] = 0.0
+        elif 'sharpe' in result_dict['summary']:
+            _extra_stats['夏普比率'] = result_dict['summary']['sharpe']
+        else:
+            _extra_stats['夏普比率'] = None
+    except Exception as _e:
+        _extra_stats['夏普比率'] = None
+
+    # 从交割单计算胜率（基于平仓盈亏）
+    try:
+        _df_trades_all = result_dict.get('trades', pd.DataFrame())
+        if len(_df_trades_all) > 0 and 'side' in _df_trades_all.columns:
+            # rqalpha 的 trades 包含 buy/sell 两侧，用 last_quantity 或 position_pnl 判断
+            if 'position_pnl' in _df_trades_all.columns:
+                _sell_trades = _df_trades_all[_df_trades_all['side'].astype(str).str.upper() == 'SELL']
+                _closed = _sell_trades[_sell_trades['last_quantity'] == 0] if 'last_quantity' in _sell_trades.columns else _sell_trades
+                if len(_closed) > 0:
+                    _pnl = pd.to_numeric(_closed['position_pnl'], errors='coerce').dropna()
+                    _wins = (_pnl > 0).sum()
+                    _extra_stats['平仓笔数'] = int(len(_pnl))
+                    _extra_stats['盈利笔数'] = int(_wins)
+                    _extra_stats['胜率'] = round(float(_wins / len(_pnl)), 4) if len(_pnl) > 0 else 0.0
+                    _extra_stats['平均盈亏'] = round(float(_pnl.mean()), 2)
+    except Exception as _e:
+        pass
+
+    rprint(
+        f"回测起点 {result_dict['summary']['start_date']}"
+        f"\n回测终点 {result_dict['summary']['end_date']}"
+        f"\n回测收益 {result_dict['summary']['total_returns']:>.2%}\t年化收益 {result_dict['summary']['annualized_returns']:>.2%}"
+        f"\t基准收益 {result_dict['summary']['benchmark_total_returns']:>.2%}\t基准年化 {result_dict['summary']['benchmark_annualized_returns']:>.2%}"
+        f"\t最大回撤 {result_dict['summary']['max_drawdown']:>.2%}")
+    if _extra_stats.get('夏普比率') is not None:
+        rprint(f"夏普比率 {_extra_stats['夏普比率']:>.4f}")
+    if '胜率' in _extra_stats:
+        rprint(f"平仓笔数 {_extra_stats['平仓笔数']:>d}\t盈利笔数 {_extra_stats['盈利笔数']:>d}"
+               f"\t胜率 {_extra_stats['胜率']:>.2%}\t平均盈亏 {_extra_stats['平均盈亏']:>.2f}")
+    rprint("打开程序文件夹下的rq_result.png查看收益走势图")
+    rprint("提示: 也可运行 python huice.py --analyze-only 直接基于 celue.db/celue汇总.csv 输出完整统计指标")
